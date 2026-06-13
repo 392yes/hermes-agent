@@ -1,5 +1,4 @@
-import { spawn } from 'child_process'
-import type { StdioOptions } from 'child_process'
+import { spawn, type ChildProcess, type StdioOptions } from 'child_process'
 type ExecFileOptions = {
   input?: string
   timeout?: number
@@ -37,7 +36,7 @@ export function execFileNoThrow(
       ? ['pipe', 'ignore', 'ignore']
       : 'pipe'
 
-    const child = spawn(file, args, {
+    const child: ChildProcess = spawn(file, args, {
       cwd: options.useCwd ? process.cwd() : undefined,
       env: options.env,
       stdio: stdioConfig
