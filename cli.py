@@ -7244,17 +7244,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if result.success and result.requires_new_session:
             _cprint("    Tip: `/reset` starts a new session immediately.")
 
-    def _handle_lead_mode_command(self, mode: str) -> None:
-        """Handle /hugo-lead and /clara-lead in the interactive CLI/TUI."""
-        try:
-            from gateway.orchestrator_modes import handle_lead_slash
-
-            reply = handle_lead_slash(mode, source=f"cli:slash:{mode}")
-        except Exception as exc:
-            _cprint(f"❌ Could not change lead mode: {exc}")
-            return
-        _cprint(f"⚙️  /{mode}\n{reply}")
-
     def _handle_natural_lead_mode_text(self, text: str) -> bool:
         """Handle natural Korean/English lead-mode commands before LLM routing.
 
@@ -7604,8 +7593,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_model_switch(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
-        elif canonical in {"hugo-lead", "clara-lead"}:
-            self._handle_lead_mode_command(canonical)
         elif canonical == "gquota":
             self._handle_gquota_command(cmd_original)
 

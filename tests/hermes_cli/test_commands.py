@@ -118,18 +118,18 @@ class TestResolveCommand:
         assert topic.name == "topic"
         assert "topic" in GATEWAY_KNOWN_COMMANDS
 
-    def test_only_two_lead_slash_commands_are_registered(self):
-        assert resolve_command("hugo-lead").name == "hugo-lead"
-        assert resolve_command("clara-lead").name == "clara-lead"
+    def test_lead_slash_commands_are_not_registered(self):
+        assert resolve_command("hugo-lead") is None
+        assert resolve_command("clara-lead") is None
         assert resolve_command("orchestrator-mode") is None
         assert resolve_command("orchestrator_mode") is None
         assert resolve_command("mode") is None
         assert "/orchestrator-mode" not in COMMANDS
         assert "/mode" not in COMMANDS
-        assert "/hugo-lead" in COMMANDS
-        assert "/clara-lead" in COMMANDS
-        assert "hugo-lead" in GATEWAY_KNOWN_COMMANDS
-        assert "clara-lead" in GATEWAY_KNOWN_COMMANDS
+        assert "/hugo-lead" not in COMMANDS
+        assert "/clara-lead" not in COMMANDS
+        assert "hugo-lead" not in GATEWAY_KNOWN_COMMANDS
+        assert "clara-lead" not in GATEWAY_KNOWN_COMMANDS
 
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"

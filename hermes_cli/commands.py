@@ -128,10 +128,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
-    CommandDef("hugo-lead", "Legacy global switch; prefer hermes-hugo for a fixed Wave pane",
-               "Configuration"),
-    CommandDef("clara-lead", "Legacy global switch; prefer hermes-clara for a fixed Wave pane",
-               "Configuration"),
     CommandDef("gquota", "Show Google Gemini Code Assist quota usage", "Info",
                cli_only=True),
 

@@ -241,23 +241,3 @@ def handle_mode_text(text: str, *, hermes_home: Path | None = None, source: str 
         return pinned_notice
     write_mode(mode, hermes_home=hermes_home, source=source)
     return "✓ 오케스트레이터 운용 모드를 전환했습니다.\n\n" + describe_mode(mode, hermes_home=hermes_home)
-
-
-def handle_lead_slash(command: str, *, hermes_home: Path | None = None, source: str = "gateway") -> str:
-    """Handle the only supported lead-mode slash commands.
-
-    Supported slash commands are intentionally just ``/hugo-lead`` and
-    ``/clara-lead``. Status remains available through the natural-language
-    gateway command ``현재 모드`` to avoid a cluttered slash-command list.
-    """
-    mode = normalize_mode(command)
-    if not mode:
-        return (
-            "사용법: /hugo-lead 또는 /clara-lead\n"
-            "현재 상태 확인은 `현재 모드`라고 보내면 됩니다."
-        )
-    pinned_notice = _pinned_switch_notice()
-    if pinned_notice:
-        return pinned_notice
-    write_mode(mode, hermes_home=hermes_home, source=source)
-    return "✓ 오케스트레이터 운용 모드를 전환했습니다.\n\n" + describe_mode(mode, hermes_home=hermes_home)

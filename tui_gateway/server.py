@@ -8020,14 +8020,6 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4004, "usage: /queue <prompt>")
         return _ok(rid, {"type": "send", "message": arg})
 
-    if name in {"hugo-lead", "clara-lead"}:
-        try:
-            from gateway.orchestrator_modes import handle_lead_slash
-
-            output = handle_lead_slash(name, source=f"tui:slash:{name}")
-        except Exception as exc:
-            return _err(rid, 5030, f"lead mode unavailable: {exc}")
-        return _ok(rid, {"type": "exec", "output": output})
 
     if name == "retry":
         if not session:

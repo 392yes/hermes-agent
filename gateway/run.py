@@ -7363,9 +7363,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
-        if canonical in {"hugo-lead", "clara-lead"}:
-            return await self._handle_lead_mode_command(event, canonical)
-
         if canonical == "personality":
             return await self._handle_personality_command(event)
 
@@ -9550,19 +9547,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_cli.blueprint_cmd import BlueprintCommandResult
 
             return BlueprintCommandResult(f"Cron blueprint command failed: {e}")
-
-    async def _handle_lead_mode_command(self, event: MessageEvent, mode: str) -> str:
-        """Handle /hugo-lead and /clara-lead for lead switching."""
-        try:
-            from gateway.orchestrator_modes import handle_lead_slash
-            return handle_lead_slash(
-                mode,
-                hermes_home=_hermes_home,
-                source=f"gateway:slash:{mode}",
-            )
-        except Exception as exc:
-            logger.exception("lead mode command failed")
-            return f"❌ Could not change lead mode: {exc}"
 
     # ────────────────────────────────────────────────────────────────
     # /goal — persistent cross-turn goals (Ralph-style loop)
