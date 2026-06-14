@@ -30,7 +30,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 
 _EOF = object()  # sentinel pushed by the reader thread when stdout closes
@@ -111,6 +111,9 @@ class ResidentClaudePool:
             "--output-format",
             "stream-json",
             "--verbose",
+            # Emit incremental assistant text (content_block_delta/text_delta)
+            # so the bridge can surface partial output instead of final-only.
+            "--include-partial-messages",
             *extra_args,
         ]
         proc = subprocess.Popen(
@@ -232,7 +235,31 @@ class ResidentClaudePool:
                 return
 
     @staticmethod
-    def _collect_until_result(entry: _ResidentProc, timeout: float) -> dict[str, Any]:
+    def _partial_text(event: Any) -> str | None:
+        """Extract incremental assistant text from a stream-json event.
+
+        With ``--include-partial-messages`` the CLI wraps raw Anthropic
+        streaming events as ``{"type": "stream_event", "event": {...}}``. We
+        surface ``content_block_delta`` text deltas; everything else is None.
+        """
+        if not isinstance(event, dict) or event.get("type") != "stream_event":
+            return None
+        ev = event.get("event")
+        if not isinstance(ev, dict) or ev.get("type") != "content_block_delta":
+            return None
+        delta = ev.get("delta")
+        if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+            return None
+        text = delta.get("text")
+        return text if isinstance(text, str) and text else None
+
+    @classmethod
+    def _collect_until_result(
+        cls,
+        entry: _ResidentProc,
+        timeout: float,
+        stream_callback: "Callable[[str], None] | None" = None,
+    ) -> dict[str, Any]:
         deadline = time.time() + max(1.0, timeout)
         while True:
             remaining = deadline - time.time()
@@ -248,6 +275,14 @@ class ResidentClaudePool:
                 raise ResidentTurnError("resident process closed stdout mid-turn")
             if isinstance(event, dict) and event.get("type") == "result":
                 return event
+            if stream_callback is not None:
+                partial = cls._partial_text(event)
+                if partial:
+                    try:
+                        stream_callback(partial)
+                    except Exception:
+                        # A failing consumer must not break the turn.
+                        pass
 
     def run_turn(
         self,
@@ -260,6 +295,7 @@ class ResidentClaudePool:
         first_prompt: str,
         followup_text: str,
         timeout: float,
+        stream_callback: "Callable[[str], None] | None" = None,
     ) -> dict[str, Any]:
         """Drive one turn; return the parsed ``result`` event dict.
 
@@ -281,7 +317,7 @@ class ResidentClaudePool:
             # memory, so only the new user message is sent.
             self._drain_nonblocking(entry)
             self._send(entry, first_prompt if is_new else followup_text)
-            result = self._collect_until_result(entry, timeout)
+            result = self._collect_until_result(entry, timeout, stream_callback)
             entry.last_used = time.time()
             sid = str(result.get("session_id") or "").strip()
             if sid:

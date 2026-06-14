@@ -55,6 +55,27 @@ _HANG_BODY = """
         time.sleep(30)
 """
 
+# Emits two partial text deltas (as --include-partial-messages would) before
+# the final result event, so we can verify partial streaming.
+_PARTIAL_BODY = """
+    import sys, json
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        for chunk in ("Hel", "lo"):
+            sys.stdout.write(json.dumps({
+                "type": "stream_event",
+                "event": {"type": "content_block_delta",
+                          "delta": {"type": "text_delta", "text": chunk}},
+            }) + "\\n")
+        sys.stdout.write(json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "Hello", "session_id": "sess-1",
+        }) + "\\n")
+        sys.stdout.flush()
+"""
+
 
 def _run(pool, claude_bin, key, first, follow, *, timeout=20.0):
     return pool.run_turn(
@@ -128,6 +149,64 @@ def test_resident_max_processes_evicts_lru(tmp_path):
         # Cap of 1 must evict the older key when a second session arrives.
         assert "k2" in pool._pool
         assert len(pool._pool) == 1
+    finally:
+        pool.shutdown_all()
+
+
+def test_partial_text_extractor():
+    pt = ResidentClaudePool._partial_text
+    # Valid text delta.
+    assert pt({"type": "stream_event", "event": {
+        "type": "content_block_delta",
+        "delta": {"type": "text_delta", "text": "hi"}}}) == "hi"
+    # Non-text deltas / other events / final result must yield None.
+    assert pt({"type": "result", "result": "done"}) is None
+    assert pt({"type": "stream_event", "event": {"type": "message_stop"}}) is None
+    assert pt({"type": "stream_event", "event": {
+        "type": "content_block_delta",
+        "delta": {"type": "input_json_delta", "partial_json": "{"}}}) is None
+    assert pt({"type": "assistant"}) is None
+    assert pt("not a dict") is None
+    # Empty text yields None (nothing to stream).
+    assert pt({"type": "stream_event", "event": {
+        "type": "content_block_delta",
+        "delta": {"type": "text_delta", "text": ""}}}) is None
+
+
+def test_resident_streams_partial_text_then_result(tmp_path):
+    claude_bin = _write_fake_claude(tmp_path, _PARTIAL_BODY)
+    pool = ResidentClaudePool()
+    chunks = []
+    try:
+        result = pool.run_turn(
+            key="k1", workdir=os.getcwd(), claude_bin=claude_bin,
+            extra_args=[], env=dict(os.environ),
+            first_prompt="frame", followup_text="msg", timeout=20.0,
+            stream_callback=chunks.append,
+        )
+        # Partials arrive incrementally, in order, before the final result.
+        assert chunks == ["Hel", "lo"]
+        assert result["result"] == "Hello"
+    finally:
+        pool.shutdown_all()
+
+
+def test_resident_stream_callback_exception_does_not_break_turn(tmp_path):
+    claude_bin = _write_fake_claude(tmp_path, _PARTIAL_BODY)
+    pool = ResidentClaudePool()
+
+    def boom(_text):
+        raise RuntimeError("consumer blew up")
+
+    try:
+        result = pool.run_turn(
+            key="k1", workdir=os.getcwd(), claude_bin=claude_bin,
+            extra_args=[], env=dict(os.environ),
+            first_prompt="frame", followup_text="msg", timeout=20.0,
+            stream_callback=boom,
+        )
+        # A failing consumer must not break result parsing.
+        assert result["result"] == "Hello"
     finally:
         pool.shutdown_all()
 

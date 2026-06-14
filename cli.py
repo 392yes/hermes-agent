@@ -10451,6 +10451,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             history=self.conversation_history[:-1],  # Exclude the message we just added
                             hermes_home=get_hermes_home(),
                             bridge_session_key=f"cli:{self.session_id}",
+                            stream_callback=stream_callback,
                         )
                         previous_history = list(self.conversation_history[:-1])
                         result = {

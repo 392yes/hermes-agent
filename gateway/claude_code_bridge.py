@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 _PROVIDER_NAMES = {"claude-code-cli", "claude_code_cli", "claude-cli", "claude_cli"}
@@ -738,8 +738,14 @@ def run_claude_code_bridge_sync(
     history: Iterable[dict[str, Any]] | None,
     hermes_home: Path,
     bridge_session_key: str | None = None,
+    stream_callback: Callable[[str], None] | None = None,
 ) -> ClaudeCodeBridgeResult:
-    """Run a gateway turn via local Claude Code CLI and return a Hermes result."""
+    """Run a gateway turn via local Claude Code CLI and return a Hermes result.
+
+    ``stream_callback`` is accepted for interface parity with the resident
+    path; the sync path buffers via ``communicate()`` so partial streaming is
+    deferred (see Phase 1 Step E). Unused here on purpose.
+    """
     bcfg = bridge_config(config)
     claude_bin = str(bcfg.get("command") or shutil.which("claude") or "claude")
     timeout = int(bcfg.get("timeout_seconds") or bcfg.get("timeout") or 1800)
@@ -972,6 +978,7 @@ def run_claude_code_bridge_resident(
     history: Iterable[dict[str, Any]] | None,
     hermes_home: Path,
     bridge_session_key: str | None = None,
+    stream_callback: Callable[[str], None] | None = None,
 ) -> ClaudeCodeBridgeResult:
     """Run a gateway turn through a resident (warm) Claude Code CLI process.
 
@@ -991,6 +998,7 @@ def run_claude_code_bridge_resident(
             history=history,
             hermes_home=hermes_home,
             bridge_session_key=bridge_session_key,
+            stream_callback=stream_callback,
         )
 
     claude_bin = str(bcfg.get("command") or shutil.which("claude") or "claude")
@@ -1108,6 +1116,7 @@ def run_claude_code_bridge_resident(
                 first_prompt=first_prompt,
                 followup_text=message,
                 timeout=timeout,
+                stream_callback=stream_callback,
             )
             break
         except ResidentTurnError as exc:
