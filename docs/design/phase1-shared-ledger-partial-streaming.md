@@ -1,6 +1,21 @@
 # Phase 1 — Shared Active Ledger + Claude Partial Streaming
 
-- 상태: **설계 (구현 전)**
+## 진행 현황 (2026-06-14 업데이트)
+| Step | 내용 | 상태 | 커밋 |
+|---|---|---|---|
+| A | ledger 모듈 (JSONL + 파일락 + trim) | ✅ 완료 | `cc3bf2870` |
+| B | write 배선 (native `turn_finalizer` / bridge `_write_bridge_ledger`) | ✅ 완료 | `be4f3b9e4` |
+| C | read/주입 (native `plugin_user_context` / bridge `build_continuity_context`) | ✅ 완료 | `cd7dc3cfc` |
+| D | resident partial streaming (`--include-partial-messages` + `stream_callback`) | ✅ 완료 (CLI/Wave) | `98abe992d` |
+| E | sync path + gateway/Slack partial streaming | ⏸ 이월 (무회귀 기본값) | — |
+
+- **단위검증**: ledger/resident/bridge/turn_context 57 테스트 통과. stream-json 이벤트 구조는 실 CLI(2.1.177)로 확인.
+- **라이브 게이트 (미완)**: 실 gateway/CLU 재기동 후 hermes-codex 1턴→hermes-claude 1턴으로 실파일 ledger 기록/주입 + partial 중간 노출 + Opus 4.8 유지 확인 필요. 재기동은 사용자 승인 후.
+- **이월 사유 (E)**: sync는 `communicate()` 버퍼링 → 라인스트리밍 전환 회귀 위험. gateway는 `_stream_consumer`가 별도 스코프라 클로저 배선 복잡. 둘 다 `stream_callback=None` 기본값이라 현행 무회귀.
+
+---
+
+- 상태: ~~설계 (구현 전)~~ → **A~D 구현 완료, E 이월**
 - 작성: 2026-06-14, Clara (clara-lead)
 - 베이스라인 커밋: `f060cac6a` (clara_cli.max_turns 반영). `strict_mcp` 변경은 워킹트리에 무수정 이월.
 - 제약: 모델 변경 금지(Opus 4.8 유지). push/PR/deploy 금지. 기존 열린 pane kill 금지. gateway restart는 사전 통보.
