@@ -6,8 +6,8 @@
 | A | ledger 모듈 (JSONL + 파일락 + trim) | ✅ 완료 | `cc3bf2870` |
 | B | write 배선 (native `turn_finalizer` / bridge `_write_bridge_ledger`) | ✅ 완료 | `be4f3b9e4` |
 | C | read/주입 (native `plugin_user_context` / bridge `build_continuity_context`) | ✅ 완료 | `cd7dc3cfc` |
-| D | resident partial streaming (`--include-partial-messages` + `stream_callback`) | ✅ 완료 (CLI/Wave) | `98abe992d` |
-| E | sync path + gateway/Slack partial streaming | ⏸ 이월 (무회귀 기본값) | — |
+| D | resident partial streaming (`--include-partial-messages` + `stream_callback`) | ↩️ 되돌림 — 사용자 판단상 체감지연완화 무의미 | `98abe992d` → revert `7401dad40` |
+| E | sync path + gateway/Slack partial streaming | ❌ 취소 (D 폐기로 불필요) | — |
 
 - **단위검증**: ledger/resident/bridge/turn_context 57 테스트 통과. stream-json 이벤트 구조는 실 CLI(2.1.177)로 확인.
 - **라이브 게이트 (미완)**: 실 gateway/CLU 재기동 후 hermes-codex 1턴→hermes-claude 1턴으로 실파일 ledger 기록/주입 + partial 중간 노출 + Opus 4.8 유지 확인 필요. 재기동은 사용자 승인 후.
