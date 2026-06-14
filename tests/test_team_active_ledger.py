@@ -148,6 +148,62 @@ class TestHelpers:
         assert ledger.build_turn_summary(None) == ""
 
 
+class TestPeerContextBlock:
+    def test_empty_when_no_peer_entries(self, tmp_path):
+        ledger.write_turn(runtime="claude", summary="mine", hermes_home=tmp_path)
+        assert (
+            ledger.peer_context_block(
+                self_runtime="claude", hermes_home=tmp_path
+            )
+            == ""
+        )
+
+    def test_renders_peer_summary(self, tmp_path):
+        ledger.write_turn(runtime="codex", summary="did the thing", hermes_home=tmp_path)
+        block = ledger.peer_context_block(self_runtime="claude", hermes_home=tmp_path)
+        assert "Shared active ledger" in block
+        assert "(codex) did the thing" in block
+
+    def test_respects_limit_and_order(self, tmp_path):
+        for i in range(3):
+            ledger.write_turn(runtime="codex", summary=f"s{i}", hermes_home=tmp_path)
+        block = ledger.peer_context_block(
+            self_runtime="claude", limit=2, hermes_home=tmp_path
+        )
+        assert "(codex) s2" in block and "(codex) s1" in block
+        assert "s0" not in block
+
+
+class TestBridgeContinuityInjection:
+    def test_continuity_context_includes_peer_ledger(self, tmp_path):
+        from gateway import claude_code_bridge
+
+        # Codex (native) wrote a turn; Clara's continuity packet should show it.
+        ledger.write_turn(
+            runtime=ledger.RUNTIME_CODEX,
+            summary="refactored the parser",
+            hermes_home=tmp_path,
+        )
+        packet = claude_code_bridge.build_continuity_context(
+            hermes_home=tmp_path, message="hello", workdir=None
+        )
+        assert "Shared active ledger" in packet
+        assert "refactored the parser" in packet
+
+    def test_continuity_context_omits_own_claude_entries(self, tmp_path):
+        from gateway import claude_code_bridge
+
+        ledger.write_turn(
+            runtime=ledger.RUNTIME_CLAUDE,
+            summary="claude self note",
+            hermes_home=tmp_path,
+        )
+        packet = claude_code_bridge.build_continuity_context(
+            hermes_home=tmp_path, message="hello", workdir=None
+        )
+        assert "claude self note" not in packet
+
+
 class TestBridgeWriteHelper:
     def test_bridge_helper_writes_claude_entry(self, tmp_path, monkeypatch):
         # _write_bridge_ledger lives in the bridge module and is the B2 path.

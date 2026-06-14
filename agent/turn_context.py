@@ -340,6 +340,25 @@ def build_turn_context(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
+    # Shared active ledger: inject the peer runtime's (Claude bridge) recent
+    # turn summary as per-turn user-message context. Injected here rather than
+    # into the cached system prompt so it never breaks prefix caching and never
+    # accumulates across turns. Best-effort.
+    try:
+        from agent import team_active_ledger
+
+        _peer_block = team_active_ledger.peer_context_block(
+            self_runtime=team_active_ledger.runtime_label(getattr(agent, "provider", "")),
+        )
+        if _peer_block:
+            plugin_user_context = (
+                (plugin_user_context + "\n\n" + _peer_block).strip()
+                if plugin_user_context
+                else _peer_block
+            )
+    except Exception:
+        logger.debug("active ledger read (native) failed", exc_info=True)
+
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
 

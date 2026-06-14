@@ -404,6 +404,21 @@ def build_continuity_context(*, hermes_home: Path, message: str, workdir: str | 
     if snippets:
         lines.append("\nRecent matching conversation snippets from the canonical Hermes session store:")
         lines.extend(snippets)
+
+    # Shared active ledger: surface the peer runtime's (native codex) recent
+    # turn so Clara sees what Hugo/Codex just did. Best-effort.
+    try:
+        from agent import team_active_ledger
+
+        peer_block = team_active_ledger.peer_context_block(
+            self_runtime=team_active_ledger.RUNTIME_CLAUDE,
+            hermes_home=hermes_home,
+        )
+        if peer_block:
+            lines.append("\n" + peer_block)
+    except Exception:
+        pass  # ledger is best-effort
+
     return "\n".join(lines)
 
 

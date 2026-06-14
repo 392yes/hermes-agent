@@ -292,6 +292,29 @@ def read_peer_recent(
     return peers
 
 
+def peer_context_block(
+    *,
+    self_runtime: str,
+    limit: int = 1,
+    hermes_home: Optional[Path] = None,
+) -> str:
+    """Render the peer runtime's recent ledger entries as an injectable block.
+
+    Returns "" when there is nothing from a peer runtime. Callers inject this
+    as per-turn context (native: into the user-message context; bridge: into
+    the continuity packet) so each runtime sees what the other just did.
+    """
+    peers = read_peer_recent(
+        self_runtime=self_runtime, limit=limit, hermes_home=hermes_home
+    )
+    if not peers:
+        return ""
+    lines = ["## Shared active ledger — peer runtime's recent turn(s)"]
+    for entry in peers:
+        lines.append(f"- ({entry.runtime}) {entry.summary}")
+    return "\n".join(lines)
+
+
 def _maybe_trim(path: Path) -> None:
     """Keep the ledger bounded. Caller must already hold the lock."""
     try:
