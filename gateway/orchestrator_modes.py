@@ -143,19 +143,17 @@ def describe_mode(mode: str | None = None, *, hermes_home: Path | None = None) -
     if current == MODE_CLARA_LEAD:
         return (
             "현재 모드: 2번 `clara-lead`\n"
-            "- Clara/Claude Code: Hugo 역할 그대로 오케스트레이터 + 코딩 주도\n"
+            "- Clara/Claude Code: 오케스트레이터 + 코딩 실행\n"
             "- 의견종합/대표 보고: Clara 단독 (보조 의견은 Clara가 취합해 하나의 보고로)\n"
             "- 일반 응답 포함 모든 기본 응답 경로: Claude Code CLI bridge(Claude 구독)\n"
-            "- Hugo: 필요 시 리뷰/테스트 보조\n"
-            "- Codex: 필요 시 보조\n"
+            "- Codex: 리뷰/테스트\n"
             "- 런타임 원칙: Claude Code CLI는 Claude 구독, Codex CLI는 ChatGPT/Codex 구독만 사용"
         )
     return (
         "현재 모드: 1번 `hugo-lead`\n"
-        "- Hugo: 오케스트레이터\n"
+        "- Hugo/Codex: 오케스트레이터 + 코딩 실행\n"
         "- 의견종합/대표 보고: Hugo 단독 (보조 의견은 Hugo가 취합해 하나의 보고로)\n"
-        "- Codex: 코딩 실행\n"
-        "- Clara/Claude Code: 리뷰/테스트\n"
+        "- Claude Code: 리뷰/테스트\n"
         "- 런타임 원칙: Codex CLI는 ChatGPT/Codex 구독, Claude Code CLI는 Claude 구독만 사용"
     )
 
@@ -167,14 +165,14 @@ def mode_system_note(hermes_home: Path | None = None) -> str:
             "[Orchestrator mode: 2번 clara-lead]\n"
             "Clara/Claude Code takes Hugo's normal lead role in this mode: receive the request, plan, execute, code, verify, coordinate helpers, and report the result. "
             "Route every normal assistant turn, including general chat replies, to the official local Claude Code CLI (`claude -p`) so the Claude subscription is used; this is not a display-only mode. "
-            "Hugo may be used as a reviewer/tester when useful, and Codex CLI may be used as a helper via its ChatGPT/Codex subscription login, but the primary response path remains Claude Code CLI. "
+            "Codex CLI is the designated reviewer/tester in this mode (run via its ChatGPT/Codex subscription login); route review/test passes to Codex, mirroring how Claude Code is the reviewer in hugo-lead. The primary response and coding path remains Claude Code CLI. "
             "Opinion synthesis: Clara alone collects and synthesizes all helper opinions into one consolidated report; helpers never report to the user separately in this mode. "
             "Do not switch Hermes to the Anthropic API provider for this mode. Keep all external side effects within the user's requested target and scope. "
             "Continuity rule: clara-lead uses the same canonical Slack session history, default Hermes session_search/state.db, memory, and active project context as hugo-lead; do not treat lead-mode switches as a loss of prior project context."
         )
     return (
         "[Orchestrator mode: 1번 hugo-lead]\n"
-        "Hugo is the lead orchestrator. Use Codex CLI as the primary coding runtime when delegating implementation so the ChatGPT/Codex subscription is used, and use Clara/Claude Code CLI as the review/test/security gate when appropriate so the Claude subscription is used. "
+        "Hugo/Codex takes the lead role in this mode: receive the request, plan, execute, code, verify, coordinate helpers, and report the result. Route normal assistant turns and implementation to the Codex CLI runtime so the ChatGPT/Codex subscription is used. Claude Code CLI is the designated reviewer/tester in this mode (run via its Claude subscription); route review/test/security passes to Claude Code, mirroring how Codex is the reviewer in clara-lead. The primary response and coding path remains Codex CLI. "
         "Opinion synthesis: Hugo alone collects and synthesizes all helper opinions into one consolidated report; helpers never report to the user separately in this mode. "
         "Do not switch Hermes to the Anthropic API provider for Claude Code subscription work. Do not push, deploy, publish, rewrite history, or delete production/business data without explicit approval. "
         "Continuity rule: hugo-lead uses the same canonical Slack session history, default Hermes session_search/state.db, memory, and active project context as clara-lead; do not treat lead-mode switches as a loss of prior project context."
