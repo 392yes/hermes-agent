@@ -236,7 +236,30 @@ def _read_json_file(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _extract_search_terms(message: str, workdir: str | None, wave_context: dict[str, Any]) -> list[str]:
+def _message_to_text(message: Any) -> str:
+    """Flatten a user message to plain text.
+
+    ``message`` is normally a string, but when the user attaches an image to a
+    vision-capable model it becomes a list of OpenAI-style content parts
+    (``{"type": "text", ...}`` / ``{"type": "image_url", ...}``). Passing that
+    list straight into ``re.findall`` raised ``TypeError: expected string or
+    bytes-like object, got 'list'`` — e.g. pasting an image with no text. Here
+    we keep only the text parts; image-only messages collapse to ``""``.
+    """
+    if isinstance(message, str):
+        return message
+    if isinstance(message, list):
+        texts: list[str] = []
+        for part in message:
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(str(part.get("text", "")))
+            elif isinstance(part, str):
+                texts.append(part)
+        return "\n".join(t for t in texts if t)
+    return str(message or "")
+
+
+def _extract_search_terms(message: Any, workdir: str | None, wave_context: dict[str, Any]) -> list[str]:
     """Return conservative FTS terms for continuity lookup."""
     candidates: list[str] = []
     for key in ("project_name", "project_path"):
@@ -245,7 +268,7 @@ def _extract_search_terms(message: str, workdir: str | None, wave_context: dict[
             candidates.append(value)
     if workdir:
         candidates.extend([workdir, Path(workdir).name])
-    candidates.append(message or "")
+    candidates.append(_message_to_text(message))
 
     terms: list[str] = []
     seen: set[str] = set()
@@ -478,7 +501,12 @@ def build_claude_prompt(
         for msg in hist:
             rendered.append(f"{msg['role']}: {msg['content']}")
         parts.append("\nRecent Slack conversation context:\n" + "\n---\n".join(rendered))
-    parts.append("\nCurrent user request:\n" + str(message))
+    request_text = _message_to_text(message)
+    if not request_text.strip():
+        # Image-only paste (no text parts): give Claude an explicit cue instead
+        # of an empty request or a raw content-parts list repr.
+        request_text = "(사용자가 텍스트 없이 이미지/첨부만 보냈습니다.)"
+    parts.append("\nCurrent user request:\n" + request_text)
     parts.append(
         "\nReturn a Slack-ready Clara response. Include what you checked, findings, and next action."
     )
