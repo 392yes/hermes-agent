@@ -683,6 +683,37 @@ def _lookup_claude_session(
     return sid or None
 
 
+def _write_bridge_ledger(
+    *,
+    hermes_home: Path,
+    bridge_session_key: str | None,
+    result_text: str,
+    exit_code: int,
+) -> None:
+    """Record this Claude bridge turn to the shared active ledger.
+
+    Best-effort: the native (codex) runtime reads these entries at turn start
+    so it knows what Clara just did. Never raises into the bridge.
+    """
+    try:
+        from agent import team_active_ledger
+
+        summary = team_active_ledger.build_turn_summary(
+            result_text,
+            end_reason="ok" if exit_code == 0 else f"exit:{exit_code}",
+        )
+        if summary:
+            team_active_ledger.write_turn(
+                runtime=team_active_ledger.RUNTIME_CLAUDE,
+                summary=summary,
+                session_id=bridge_session_key,
+                end_reason="ok" if exit_code == 0 else f"exit:{exit_code}",
+                hermes_home=hermes_home,
+            )
+    except Exception:
+        pass  # ledger is best-effort; never break the bridge turn
+
+
 def run_claude_code_bridge_sync(
     *,
     config: dict[str, Any] | None,
@@ -859,6 +890,13 @@ def run_claude_code_bridge_sync(
     usage_line = format_token_usage_line(parsed)
     if usage_line:
         result_text += f"\n_{usage_line}_"
+
+    _write_bridge_ledger(
+        hermes_home=hermes_home,
+        bridge_session_key=bridge_session_key,
+        result_text=result_text,
+        exit_code=exit_code,
+    )
 
     return ClaudeCodeBridgeResult(
         final_response=result_text,
@@ -1099,6 +1137,13 @@ def run_claude_code_bridge_resident(
         log_dir=log_dir,
         max_turns=max_turns,
         bcfg=bcfg,
+    )
+
+    _write_bridge_ledger(
+        hermes_home=hermes_home,
+        bridge_session_key=bridge_session_key,
+        result_text=result_text,
+        exit_code=exit_code,
     )
 
     return ClaudeCodeBridgeResult(

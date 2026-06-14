@@ -119,6 +119,72 @@ class TestConcurrency:
             assert "-" in obj["summary"]
 
 
+class TestHelpers:
+    def test_runtime_label_maps_known_providers(self):
+        assert ledger.runtime_label("anthropic") == ledger.RUNTIME_CLAUDE
+        assert ledger.runtime_label("claude-code") == ledger.RUNTIME_CLAUDE
+        assert ledger.runtime_label("openai-codex") == ledger.RUNTIME_CODEX
+        assert ledger.runtime_label("") == ledger.RUNTIME_CODEX
+        assert ledger.runtime_label(None) == ledger.RUNTIME_CODEX
+
+    def test_build_summary_includes_head_and_tags(self):
+        s = ledger.build_turn_summary(
+            "Fixed the bug.", tool_count=3, last_tool="Edit", end_reason="ok"
+        )
+        assert s.startswith("Fixed the bug.")
+        assert "3 tool turns" in s
+        assert "last: Edit" in s
+        assert "exit: ok" in s
+
+    def test_build_summary_singular_tool(self):
+        s = ledger.build_turn_summary("x", tool_count=1)
+        assert "1 tool turn" in s and "tool turns" not in s
+
+    def test_build_summary_tags_only_when_no_response(self):
+        s = ledger.build_turn_summary("", tool_count=2)
+        assert s == "[2 tool turns]"
+
+    def test_build_summary_empty_is_empty(self):
+        assert ledger.build_turn_summary(None) == ""
+
+
+class TestBridgeWriteHelper:
+    def test_bridge_helper_writes_claude_entry(self, tmp_path, monkeypatch):
+        # _write_bridge_ledger lives in the bridge module and is the B2 path.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from gateway import claude_code_bridge
+
+        claude_code_bridge._write_bridge_ledger(
+            hermes_home=tmp_path,
+            bridge_session_key="cli:sess-1",
+            result_text="Reviewed the diff.\n\n_Claude Code CLI job: x_",
+            exit_code=0,
+        )
+        # The native (codex) side should now see Clara's entry.
+        peers = ledger.read_peer_recent(
+            self_runtime=ledger.RUNTIME_CODEX, hermes_home=tmp_path
+        )
+        assert len(peers) == 1
+        assert peers[0].runtime == ledger.RUNTIME_CLAUDE
+        assert peers[0].summary.startswith("Reviewed the diff.")
+        assert peers[0].session_id == "cli:sess-1"
+        assert peers[0].end_reason == "ok"
+
+    def test_bridge_helper_records_error_exit(self, tmp_path):
+        from gateway import claude_code_bridge
+
+        claude_code_bridge._write_bridge_ledger(
+            hermes_home=tmp_path,
+            bridge_session_key="cli:sess-2",
+            result_text="boom",
+            exit_code=1,
+        )
+        peers = ledger.read_peer_recent(
+            self_runtime=ledger.RUNTIME_CODEX, hermes_home=tmp_path
+        )
+        assert peers[0].end_reason == "exit:1"
+
+
 class TestTrim:
     def test_trim_keeps_recent_when_over_byte_ceiling(self, tmp_path, monkeypatch):
         # Shrink ceilings so the test stays fast.

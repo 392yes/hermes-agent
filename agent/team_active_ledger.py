@@ -96,6 +96,60 @@ def _opt_str(value: Any) -> Optional[str]:
     return text or None
 
 
+# Stable runtime labels used as the ledger's "who wrote this" key. The two
+# collaborating runtimes are the native Hermes agent ("codex") and the Claude
+# Code CLI bridge ("claude").
+RUNTIME_CODEX = "codex"
+RUNTIME_CLAUDE = "claude"
+
+
+def runtime_label(provider: Optional[str]) -> str:
+    """Map a Hermes provider string to a stable ledger runtime label.
+
+    The bridge path always writes ``RUNTIME_CLAUDE`` directly; this helper is
+    for the native agent path, where the parent provider identifies the
+    runtime. Unknown providers fall back to ``RUNTIME_CODEX`` since that is the
+    only native runtime in this deployment.
+    """
+    text = str(provider or "").strip().lower()
+    if "anthropic" in text or "claude" in text:
+        return RUNTIME_CLAUDE
+    return RUNTIME_CODEX
+
+
+def build_turn_summary(
+    final_response: Optional[str],
+    *,
+    tool_count: Optional[int] = None,
+    last_tool: Optional[str] = None,
+    end_reason: Optional[str] = None,
+) -> str:
+    """Build a lightweight (no-LLM) turn summary for the ledger.
+
+    Heuristic: the head of the assistant's final response plus a compact tag of
+    tool activity / exit reason. Whitespace is collapsed; ``write_turn`` applies
+    the hard length clamp.
+    """
+    head = " ".join(str(final_response or "").split())
+    if len(head) > 400:
+        head = head[:399].rstrip() + "…"
+
+    tags: List[str] = []
+    if tool_count:
+        tag = f"{tool_count} tool turn{'s' if tool_count != 1 else ''}"
+        if last_tool:
+            tag += f" (last: {last_tool})"
+        tags.append(tag)
+    if end_reason:
+        tags.append(f"exit: {end_reason}")
+
+    if tags and head:
+        return f"{head}  [{'; '.join(tags)}]"
+    if tags:
+        return f"[{'; '.join(tags)}]"
+    return head
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 

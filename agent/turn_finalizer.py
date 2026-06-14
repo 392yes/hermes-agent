@@ -425,4 +425,28 @@ def finalize_turn(
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 
+    # Shared active ledger: record this turn so the peer runtime (Claude Code
+    # bridge) sees what the native agent just did. Best-effort; never breaks
+    # the turn.
+    try:
+        from agent import team_active_ledger
+
+        _summary = team_active_ledger.build_turn_summary(
+            final_response,
+            tool_count=_turn_tool_count,
+            last_tool=_last_tool_name,
+            end_reason=_turn_exit_reason,
+        )
+        if _summary:
+            team_active_ledger.write_turn(
+                runtime=team_active_ledger.runtime_label(getattr(agent, "provider", "")),
+                summary=_summary,
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                end_reason=_turn_exit_reason,
+            )
+    except Exception:
+        logger.debug("active ledger write (native) failed", exc_info=True)
+
     return result

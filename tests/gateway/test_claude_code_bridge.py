@@ -235,17 +235,23 @@ def test_resolve_workdir_keeps_explicit_prompt_path_above_config(tmp_path):
     assert workdir == str(explicit_project)
 
 
-def test_run_bridge_uses_agent_max_turns_for_claude_cli(tmp_path):
-    fake = tmp_path / "claude"
-    fake.write_text(
+def _make_fake_claude_asserting_max_turns(path, expected):
+    path.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
         "idx = sys.argv.index('--max-turns')\n"
-        "assert sys.argv[idx + 1] == '7'\n"
+        f"assert sys.argv[idx + 1] == {expected!r}, sys.argv[idx + 1]\n"
         "print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'OK'}))\n",
         encoding="utf-8",
     )
-    fake.chmod(0o755)
+    path.chmod(0o755)
+
+
+def test_run_bridge_prefers_clara_cli_max_turns_for_claude_cli(tmp_path):
+    # clara_cli.max_turns is the bridge-specific speed-tuning knob and must take
+    # precedence over the generic agent.max_turns when both are set.
+    fake = tmp_path / "claude"
+    _make_fake_claude_asserting_max_turns(fake, "99")
     workdir = tmp_path / "repo"
     workdir.mkdir()
 
@@ -257,6 +263,35 @@ def test_run_bridge_uses_agent_max_turns_for_claude_cli(tmp_path):
                 "workdir": str(workdir),
                 "allowed_tools": "Read",
                 "max_turns": 99,
+                "timeout_seconds": 10,
+            },
+        },
+        message="ping",
+        context_prompt=None,
+        channel_prompt=None,
+        history=[],
+        hermes_home=tmp_path / "hermes",
+    )
+
+    assert result.exit_code == 0
+    assert result.final_response.startswith("🟪 Clara/클라라 — OK")
+
+
+def test_run_bridge_falls_back_to_agent_max_turns_when_clara_cli_unset(tmp_path):
+    # When clara_cli.max_turns is not configured, the generic agent.max_turns
+    # is still honored as the fallback.
+    fake = tmp_path / "claude"
+    _make_fake_claude_asserting_max_turns(fake, "7")
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+
+    result = run_claude_code_bridge_sync(
+        config={
+            "agent": {"max_turns": 7},
+            "clara_cli": {
+                "command": str(fake),
+                "workdir": str(workdir),
+                "allowed_tools": "Read",
                 "timeout_seconds": 10,
             },
         },
