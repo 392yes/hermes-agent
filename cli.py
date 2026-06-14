@@ -3977,6 +3977,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         idle = max(0.0, time.time() - last_finished_at)
         return f"✓ {format_duration_compact(idle)}"
 
+    @staticmethod
+    def _format_claude_code_status_model(model_name: str) -> str:
+        """Return the compact status-bar label for Clara/Claude Code lead mode."""
+        model_short = str(model_name or "").strip().split("/")[-1]
+        if model_short.startswith("claude-"):
+            model_short = model_short[len("claude-"):]
+
+        opus_match = re.fullmatch(r"opus-(\d+)[.-](\d+)", model_short)
+        if opus_match:
+            return f"opus-{opus_match.group(1)}.{opus_match.group(2)}"
+
+        return model_short
+
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
         # self.model reflects the originally configured model and never
@@ -4007,17 +4020,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         if isinstance(settings, dict):
                             claude_model = str(settings.get("model") or "").strip()
                 if claude_model:
-                    claude_model_short = claude_model.split("/")[-1]
+                    claude_model_short = self._format_claude_code_status_model(claude_model)
                     # Keep Clara lead compact enough that the status-bar
                     # renderer can preserve the strong/accent color instead
                     # of falling back to a monochrome trimmed string in narrow
-                    # Wave panes.  `Clara fable-5` still identifies the
-                    # Claude Code model while fitting like `gpt-5.5`.
-                    if claude_model_short.startswith("claude-"):
-                        claude_model_short = claude_model_short[len("claude-"):]
-                    display_model_short = f"Clara {claude_model_short}"
+                    # Wave panes.  Use the Claude Code model label without the
+                    # role prefix so `claude-opus-4-8` renders as `opus-4.8`.
+                    display_model_short = claude_model_short
                 else:
-                    display_model_short = "Clara Code"
+                    display_model_short = "Claude Code"
                 claude_usage_status = _get_claude_code_usage_status_cached()
                 if len(display_model_short) > 26:
                     display_model_short = f"{display_model_short[:23]}..."
@@ -7247,8 +7258,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
     def _handle_natural_lead_mode_text(self, text: str) -> bool:
         """Handle natural Korean/English lead-mode commands before LLM routing.
 
-        This keeps `현재모드` from being interpreted by the Wave role-board
-        chat/council/project router.  In the T1 chat surface, Sangkun expects
+        This keeps `현재모드` as a local UI/control command. Sangkun expects
         this phrase to report the Hugo/Clara lead runtime mode, not the
         Wave-board interaction mode.
         """
@@ -10420,10 +10430,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         # handled by the official local Claude Code CLI bridge so
                         # Sangkun's Claude subscription runtime is used instead
                         # of Hermes' parent OpenAI/Codex provider.
-                        from gateway.claude_code_bridge import run_claude_code_bridge_sync
+                        from gateway.claude_code_bridge import (
+                            bridge_config,
+                            run_claude_code_bridge_resident,
+                            run_claude_code_bridge_sync,
+                        )
 
-                        bridge_result = run_claude_code_bridge_sync(
-                            config=getattr(self, "config", {}) or {},
+                        _bridge_config = getattr(self, "config", {}) or {}
+                        _bridge_runner = (
+                            run_claude_code_bridge_resident
+                            if bridge_config(_bridge_config).get("resident_enabled")
+                            else run_claude_code_bridge_sync
+                        )
+
+                        bridge_result = _bridge_runner(
+                            config=_bridge_config,
                             message=agent_message,
                             context_prompt=None,
                             channel_prompt=None,
@@ -11456,8 +11477,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             has_images = bool(self._attached_images)
             if text or has_images:
                 # Natural lead-mode controls (e.g. `현재모드`) are UI commands,
-                # not LLM turns. Handle them before the Wave role-board router
-                # can classify the phrase as chat/council/project mode.
+                # not LLM turns. Handle them before normal LLM routing.
                 if text and not has_images and self._handle_natural_lead_mode_text(text):
                     event.app.current_buffer.reset(append_to_history=True)
                     return
@@ -14135,10 +14155,21 @@ def main(
                                 route_via_claude_code = False
 
                             if route_via_claude_code:
-                                from gateway.claude_code_bridge import run_claude_code_bridge_sync
+                                from gateway.claude_code_bridge import (
+                                    bridge_config,
+                                    run_claude_code_bridge_resident,
+                                    run_claude_code_bridge_sync,
+                                )
 
-                                bridge_result = run_claude_code_bridge_sync(
-                                    config=getattr(cli, "config", {}) or {},
+                                _bridge_config = getattr(cli, "config", {}) or {}
+                                _bridge_runner = (
+                                    run_claude_code_bridge_resident
+                                    if bridge_config(_bridge_config).get("resident_enabled")
+                                    else run_claude_code_bridge_sync
+                                )
+
+                                bridge_result = _bridge_runner(
+                                    config=_bridge_config,
                                     message=effective_query if isinstance(effective_query, str) else str(effective_query),
                                     context_prompt=None,
                                     channel_prompt=None,

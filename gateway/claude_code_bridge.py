@@ -119,33 +119,11 @@ def extract_explicit_workdir(message: str) -> str | None:
     return None
 
 
-def _active_wave_project_path(hermes_home: Path | None = None) -> str | None:
-    """Return the active Wave project path when it points at a local directory."""
-    home = _canonical_hermes_home(hermes_home or Path.home() / ".hermes")
-    project = _read_json_file(home / "wave-hub" / "current_project.json")
-    value = str(project.get("project_path") or "").strip()
-    if not value:
-        return None
-    path = Path(_expand_path(value))
-    if path.is_dir():
-        return str(path)
-    return None
-
-
 def resolve_workdir(config: dict[str, Any] | None, message: str, hermes_home: Path | None = None) -> str:
-    """Resolve the cwd for Claude Code, preferring user/project context.
-
-    Explicit prompt paths remain the strongest user intent. Otherwise Clara
-    lead should run from Wave's active project path before falling back to
-    bridge/terminal defaults, so project-mode turns operate in the same repo
-    Hugo/Wave routed for the request.
-    """
+    """Resolve the cwd for Claude Code, preferring explicit prompt/config context."""
     explicit = extract_explicit_workdir(message)
     if explicit:
         return explicit
-    active_project = _active_wave_project_path(hermes_home)
-    if active_project:
-        return active_project
     bcfg = bridge_config(config)
     for key in ("workdir", "default_workdir", "cwd"):
         value = bcfg.get(key)
@@ -413,14 +391,6 @@ def build_continuity_context(*, hermes_home: Path, message: str, workdir: str | 
     default Hermes store.
     """
     canonical_home = _canonical_hermes_home(hermes_home)
-    hub = canonical_home / "wave-hub"
-    ctx = _read_json_file(hub / "current_context.json")
-    project = _read_json_file(hub / "current_project.json")
-    wave_context: dict[str, Any] = {}
-    for data in (project, ctx):
-        for key in ("mode", "scope", "project_name", "project_path"):
-            if data.get(key) and not wave_context.get(key):
-                wave_context[key] = data.get(key)
 
     lines = [
         "## Mode-independent continuity context",
@@ -428,13 +398,8 @@ def build_continuity_context(*, hermes_home: Path, message: str, workdir: str | 
         f"Canonical Hermes home/session DB: {canonical_home}",
         "Use this context as a starting point. If it is insufficient and you have local file/shell access, inspect project files and/or ~/.hermes/state.db rather than assuming prior context is unavailable.",
     ]
-    if wave_context:
-        lines.append("\nActive Wave/project context:")
-        for key in ("mode", "scope", "project_name", "project_path"):
-            if wave_context.get(key):
-                lines.append(f"- {key}: {wave_context[key]}")
     lines.extend(_handover_context_lines(workdir))
-    terms = _extract_search_terms(message, workdir, wave_context)
+    terms = _extract_search_terms(message, workdir, {})
     snippets = _query_recent_session_snippets(canonical_home, terms)
     if snippets:
         lines.append("\nRecent matching conversation snippets from the canonical Hermes session store:")
@@ -893,6 +858,247 @@ def run_claude_code_bridge_sync(
     usage_line = format_token_usage_line(parsed)
     if usage_line:
         result_text += f"\n_{usage_line}_"
+
+    return ClaudeCodeBridgeResult(
+        final_response=result_text,
+        job_id=job_id,
+        workdir=workdir,
+        log_dir=str(log_dir),
+        exit_code=exit_code,
+        raw_json=parsed,
+    )
+
+
+def _format_bridge_result_text(
+    *,
+    parsed: dict[str, Any] | None,
+    exit_code: int,
+    job_id: str,
+    log_dir: Path,
+    max_turns: int,
+    bcfg: dict[str, Any],
+    stderr: str = "",
+    stdout: str = "",
+) -> str:
+    """Shared success/failure -> Slack text rendering for both bridge paths."""
+    if exit_code == 0 and parsed and not parsed.get("is_error"):
+        result_text = str(parsed.get("result") or "").strip()
+        if not result_text:
+            result_text = "Claude Code CLI completed but returned an empty result."
+    else:
+        result_text = _format_failure_result(
+            parsed=parsed,
+            stderr=stderr,
+            stdout=stdout,
+            job_id=job_id,
+            exit_code=exit_code,
+            log_dir=log_dir,
+            max_turns=max_turns,
+        )
+    prefix = str(bcfg.get("response_prefix") or "🟪 Clara/클라라 — ")
+    if prefix:
+        marker = prefix.strip()
+        body = result_text.lstrip()
+        while marker and body.startswith(marker):
+            body = body[len(marker):].lstrip()
+        result_text = prefix + body
+    result_text += f"\n\n_Claude Code CLI job: {job_id}_"
+    usage_line = format_token_usage_line(parsed)
+    if usage_line:
+        result_text += f"\n_{usage_line}_"
+    return result_text
+
+
+def run_claude_code_bridge_resident(
+    *,
+    config: dict[str, Any] | None,
+    message: str,
+    context_prompt: str | None,
+    channel_prompt: str | None,
+    history: Iterable[dict[str, Any]] | None,
+    hermes_home: Path,
+    bridge_session_key: str | None = None,
+) -> ClaudeCodeBridgeResult:
+    """Run a gateway turn through a resident (warm) Claude Code CLI process.
+
+    Keeps a long-lived ``claude`` stream-json process per (session, workdir) so
+    conversation context survives in process memory, independent of Anthropic's
+    ~5 minute prompt-cache TTL.  Any process/protocol failure transparently
+    falls back to :func:`run_claude_code_bridge_sync`, so this path can never be
+    a single point of failure.
+    """
+    bcfg = bridge_config(config)
+    if not bcfg.get("resident_enabled"):
+        return run_claude_code_bridge_sync(
+            config=config,
+            message=message,
+            context_prompt=context_prompt,
+            channel_prompt=channel_prompt,
+            history=history,
+            hermes_home=hermes_home,
+            bridge_session_key=bridge_session_key,
+        )
+
+    claude_bin = str(bcfg.get("command") or shutil.which("claude") or "claude")
+    timeout = int(bcfg.get("timeout_seconds") or bcfg.get("timeout") or 1800)
+    idle_timeout = float(bcfg.get("resident_idle_timeout_seconds") or 1200)
+    max_processes = int(bcfg.get("resident_max_processes") or 8)
+    agent_cfg = config.get("agent") if isinstance(config, dict) else {}
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+    max_turns = int(agent_cfg.get("max_turns") or 20)
+    configured_allowed_tools = bcfg.get("allowed_tools")
+    history_limit = int(bcfg.get("history_limit") or 12)
+    model = str(bcfg.get("model") or "").strip()
+    effort = str(bcfg.get("effort") or "").strip()
+    permission_mode = str(bcfg.get("permission_mode") or "bypassPermissions").strip()
+    role_mode = str(bcfg.get("role_mode") or bcfg.get("role") or "").strip()
+    if not role_mode:
+        try:
+            from gateway.orchestrator_modes import read_mode, MODE_CLARA_LEAD
+            role_mode = "clara-lead" if read_mode(hermes_home).get("mode") == MODE_CLARA_LEAD else "reviewer"
+        except Exception:
+            role_mode = "reviewer"
+    role_is_lead = role_mode.strip().casefold().replace("_", "-") in {"lead", "clara-lead", "orchestrator", "coder"}
+    if configured_allowed_tools:
+        allowed_tools = str(configured_allowed_tools)
+    elif role_is_lead:
+        allowed_tools = ""
+    else:
+        allowed_tools = "".join(_DEFAULT_ALLOWED_TOOLS)
+
+    workdir = resolve_workdir(config, message, hermes_home=hermes_home)
+    resume_disabled_env = str(os.environ.get(_ENV_DISABLE_RESUME, "")).strip().casefold() in {"1", "true", "yes", "on"}
+    resume_cfg = bcfg.get("resume_enabled")
+    resume_disabled_config = isinstance(resume_cfg, bool) and not resume_cfg
+    resume_enabled = not (resume_disabled_env or resume_disabled_config)
+    resume_session_id = _lookup_claude_session(
+        hermes_home=hermes_home,
+        bridge_session_key=bridge_session_key,
+        workdir=workdir,
+        enabled=resume_enabled,
+    )
+    continuity_context = build_continuity_context(
+        hermes_home=hermes_home,
+        message=message,
+        workdir=workdir,
+    )
+    job_id = f"clara-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    log_dir = hermes_home / "clara-jobs" / job_id
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    first_prompt = build_claude_prompt(
+        message=message,
+        context_prompt=context_prompt,
+        channel_prompt=channel_prompt,
+        history=history,
+        history_limit=history_limit,
+        workdir=workdir,
+        role_mode=role_mode,
+        continuity_context=continuity_context,
+    )
+    (log_dir / "prompt.txt").write_text(first_prompt, encoding="utf-8")
+
+    extra_args: list[str] = ["--max-turns", str(max_turns)]
+    if resume_session_id:
+        extra_args[:0] = ["--resume", resume_session_id]
+    if allowed_tools:
+        extra_args.extend(["--allowedTools", allowed_tools])
+    if permission_mode:
+        extra_args.extend(["--permission-mode", permission_mode])
+    if model:
+        extra_args.extend(["--model", model])
+    if effort:
+        extra_args.extend(["--effort", effort])
+
+    pool_key = "|".join(
+        [
+            _normalize_bridge_session_key(bridge_session_key) or "default",
+            str(workdir),
+        ]
+    )
+
+    metadata = {
+        "job_id": job_id,
+        "workdir": workdir,
+        "created_at": time.time(),
+        "provider": "claude-code-cli",
+        "delivery": "resident",
+        "max_turns": max_turns,
+        "allowed_tools": allowed_tools or "default",
+        "timeout_seconds": timeout,
+        "role_mode": role_mode,
+        "bridge_session_key": _normalize_bridge_session_key(bridge_session_key),
+        "resume_session_id": resume_session_id,
+        "resume_enabled": resume_enabled,
+        "resident_idle_timeout_seconds": idle_timeout,
+        "resident_max_processes": max_processes,
+    }
+    (log_dir / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    from gateway.claude_resident import get_pool, ResidentTurnError
+
+    pool = get_pool(idle_timeout=idle_timeout, max_processes=max_processes)
+    parsed: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            parsed = pool.run_turn(
+                key=pool_key,
+                workdir=workdir,
+                claude_bin=claude_bin,
+                extra_args=extra_args,
+                env=_safe_env(),
+                first_prompt=first_prompt,
+                followup_text=message,
+                timeout=timeout,
+            )
+            break
+        except ResidentTurnError as exc:
+            # Drop the (possibly wedged) process and retry once with a fresh
+            # spawn; if that also fails, fall back to the classic per-turn path.
+            last_error = exc
+            pool.invalidate(pool_key)
+            continue
+
+    if parsed is None:
+        (log_dir / "stderr.log").write_text(
+            f"resident path failed, fell back to sync spawn: {last_error}",
+            encoding="utf-8",
+        )
+        return run_claude_code_bridge_sync(
+            config=config,
+            message=message,
+            context_prompt=context_prompt,
+            channel_prompt=channel_prompt,
+            history=history,
+            hermes_home=hermes_home,
+            bridge_session_key=bridge_session_key,
+        )
+
+    (log_dir / "result.json").write_text(
+        json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _remember_claude_session(
+        hermes_home=hermes_home,
+        bridge_session_key=bridge_session_key,
+        claude_session_id=parsed.get("session_id"),
+        workdir=workdir,
+        job_id=job_id,
+    )
+
+    is_error = bool(parsed.get("is_error")) or str(parsed.get("subtype") or "success") != "success"
+    exit_code = 1 if is_error else 0
+    result_text = _format_bridge_result_text(
+        parsed=parsed,
+        exit_code=exit_code,
+        job_id=job_id,
+        log_dir=log_dir,
+        max_turns=max_turns,
+        bcfg=bcfg,
+    )
 
     return ClaudeCodeBridgeResult(
         final_response=result_text,

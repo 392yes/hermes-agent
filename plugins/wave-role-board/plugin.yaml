@@ -1,6 +1,0 @@
-name: wave-role-board
-version: 1.0.0
-description: "Expose Wave Terminal T2 role-board tools for deliberate Coda/Clara/Mira/Nova status notes. Automatic raw tool hooks are disabled to avoid noisy panes."
-author: "Hermes Agent"
-kind: standalone
-hooks: []

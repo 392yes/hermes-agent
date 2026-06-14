@@ -13281,7 +13281,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # handling around the returned result.
         try:
             from gateway.claude_code_bridge import (
+                bridge_config,
                 is_claude_code_cli_config,
+                run_claude_code_bridge_resident,
                 run_claude_code_bridge_sync,
             )
 
@@ -13294,8 +13296,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     route_via_claude_code = False
 
             if route_via_claude_code:
+                # Resident path keeps a warm claude process per session/workdir;
+                # it self-falls back to the classic per-turn spawn on any
+                # process/protocol failure. Hugo's native path never gets here.
+                _bridge_runner = (
+                    run_claude_code_bridge_resident
+                    if bridge_config(user_config).get("resident_enabled")
+                    else run_claude_code_bridge_sync
+                )
                 bridge_result = await asyncio.to_thread(
-                    run_claude_code_bridge_sync,
+                    _bridge_runner,
                     config=user_config,
                     message=message,
                     context_prompt=context_prompt,

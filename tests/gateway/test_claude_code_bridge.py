@@ -65,19 +65,9 @@ def test_build_prompt_in_clara_lead_overrides_hugo_channel_marker():
     assert "🟦 Hugo/휴고 —" not in prompt
 
 
-def test_build_continuity_context_reads_active_project_and_session_snippets(tmp_path):
+def test_build_continuity_context_reads_session_snippets(tmp_path):
     hermes_home = tmp_path / "hermes"
-    hub = hermes_home / "wave-hub"
-    hub.mkdir(parents=True)
-    (hub / "current_context.json").write_text(
-        json.dumps({
-            "mode": "project",
-            "scope": "project",
-            "project_name": "WorkPilot_Commerce",
-            "project_path": "/Users/392yes/project/001_WorkPilot_Commerce",
-        }),
-        encoding="utf-8",
-    )
+    hermes_home.mkdir(parents=True)
     con = sqlite3.connect(hermes_home / "state.db")
     con.executescript(
         """
@@ -112,12 +102,7 @@ def test_build_continuity_context_reads_active_project_and_session_snippets(tmp_
 def test_build_continuity_context_collapses_profile_home_to_canonical_root(tmp_path):
     canonical = tmp_path / ".hermes"
     profile_home = canonical / "profiles" / "wpcorderbot"
-    (canonical / "wave-hub").mkdir(parents=True)
     profile_home.mkdir(parents=True)
-    (canonical / "wave-hub" / "current_context.json").write_text(
-        json.dumps({"mode": "project", "project_name": "WPC"}),
-        encoding="utf-8",
-    )
 
     context = build_continuity_context(
         hermes_home=profile_home,
@@ -125,7 +110,6 @@ def test_build_continuity_context_collapses_profile_home_to_canonical_root(tmp_p
         workdir=None,
     )
     assert f"Canonical Hermes home/session DB: {canonical}" in context
-    assert "project_name: WPC" in context
 
 
 def test_build_continuity_context_surfaces_session_handover_file(tmp_path):
@@ -223,43 +207,29 @@ def test_run_bridge_does_not_duplicate_role_marker(tmp_path):
     assert result.final_response.startswith("🟪 Clara/클라라 — **결론: 준비 완료**")
 
 
-def test_resolve_workdir_prefers_active_wave_project_before_config(tmp_path):
-    hermes_home = tmp_path / ".hermes"
-    active_project = tmp_path / "active-project"
+def test_resolve_workdir_prefers_config_when_no_explicit_path(tmp_path):
     configured_project = tmp_path / "configured-project"
-    active_project.mkdir(parents=True)
     configured_project.mkdir()
-    hub = hermes_home / "wave-hub"
-    hub.mkdir(parents=True)
-    (hub / "current_project.json").write_text(
-        json.dumps({"project_path": str(active_project)}), encoding="utf-8"
-    )
 
     workdir = resolve_workdir(
         {"claude_code_cli": {"workdir": str(configured_project)}},
         "이 프로젝트에서 계속 작업해줘",
-        hermes_home=hermes_home,
+        hermes_home=tmp_path / ".hermes",
     )
 
-    assert workdir == str(active_project)
+    assert workdir == str(configured_project)
 
 
-def test_resolve_workdir_keeps_explicit_prompt_path_above_active_project(tmp_path):
-    hermes_home = tmp_path / ".hermes"
-    active_project = tmp_path / "active-project"
+def test_resolve_workdir_keeps_explicit_prompt_path_above_config(tmp_path):
+    configured_project = tmp_path / "configured-project"
     explicit_project = tmp_path / "explicit-project"
-    active_project.mkdir(parents=True)
+    configured_project.mkdir()
     explicit_project.mkdir()
-    hub = hermes_home / "wave-hub"
-    hub.mkdir(parents=True)
-    (hub / "current_project.json").write_text(
-        json.dumps({"project_path": str(active_project)}), encoding="utf-8"
-    )
 
     workdir = resolve_workdir(
-        {},
+        {"claude_code_cli": {"workdir": str(configured_project)}},
         f"{explicit_project} 여기에서 작업해줘",
-        hermes_home=hermes_home,
+        hermes_home=tmp_path / ".hermes",
     )
 
     assert workdir == str(explicit_project)

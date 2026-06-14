@@ -465,7 +465,11 @@ def run_conversation(
     # subscription login rather than Anthropic API billing.
     if agent.api_mode == "claude_code_cli":
         try:
-            from gateway.claude_code_bridge import run_claude_code_bridge_sync
+            from gateway.claude_code_bridge import (
+                bridge_config as _bridge_config_for_claude,
+                run_claude_code_bridge_resident,
+                run_claude_code_bridge_sync,
+            )
             from hermes_constants import get_hermes_home
             try:
                 from hermes_cli.config import load_config as _load_cli_config
@@ -475,7 +479,12 @@ def run_conversation(
             bridge_config = dict(bridge_config) if isinstance(bridge_config, dict) else {}
             bridge_config.setdefault("model", {"provider": "claude-code-cli", "default": agent.model})
 
-            bridge_result = run_claude_code_bridge_sync(
+            _bridge_runner = (
+                run_claude_code_bridge_resident
+                if _bridge_config_for_claude(bridge_config).get("resident_enabled")
+                else run_claude_code_bridge_sync
+            )
+            bridge_result = _bridge_runner(
                 config=bridge_config,
                 message=user_message,
                 context_prompt=system_message,
