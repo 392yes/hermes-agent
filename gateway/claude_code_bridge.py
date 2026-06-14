@@ -701,9 +701,10 @@ def run_claude_code_bridge_sync(
     agent_cfg = config.get("agent") if isinstance(config, dict) else {}
     if not isinstance(agent_cfg, dict):
         agent_cfg = {}
-    # Clara lead / Claude Code CLI bridge follows the same agent loop budget
-    # as normal Hermes turns. Do not maintain a separate bridge-only cap.
-    max_turns = int(agent_cfg.get("max_turns") or 20)
+    # Prefer the bridge-specific cap when configured; otherwise fall back to the
+    # normal Hermes agent loop budget.  This keeps clara_cli.max_turns meaningful
+    # for speed tuning without breaking existing configs that only set agent.*.
+    max_turns = int(bcfg.get("max_turns") or agent_cfg.get("max_turns") or 20)
     configured_allowed_tools = bcfg.get("allowed_tools")
     history_limit = int(bcfg.get("history_limit") or 12)
     model = str(bcfg.get("model") or "").strip()
@@ -946,7 +947,7 @@ def run_claude_code_bridge_resident(
     agent_cfg = config.get("agent") if isinstance(config, dict) else {}
     if not isinstance(agent_cfg, dict):
         agent_cfg = {}
-    max_turns = int(agent_cfg.get("max_turns") or 20)
+    max_turns = int(bcfg.get("max_turns") or agent_cfg.get("max_turns") or 20)
     configured_allowed_tools = bcfg.get("allowed_tools")
     history_limit = int(bcfg.get("history_limit") or 12)
     model = str(bcfg.get("model") or "").strip()
