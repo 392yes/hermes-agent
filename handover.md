@@ -2,265 +2,158 @@
 type: session-handover
 canonical: true
 project: hermes-agent
-session_end: 2026-06-13 07:53
-git_branch: feat/wave-role-board
-git_commit: 27b259f84
+session_end: 2026-06-17 16:19
+git_branch: remove-t2-role-board-cleanup
+git_commit: d55b0c606
 ---
 
-# Session Handover — hermes-agent (2026-06-13 07:53)
+# Session Handover — hermes-agent (2026-06-17 16:19)
 
 ## 1. 현재 상태 (다음 세션 시작점)
-
-Wave Terminal 로컬 병행 작업대 모델을 `hermes-hugo` / `hermes-clara`로 단순화하는 작업을 진행했다. 현재 repo `/Users/392yes/.hermes/hermes-agent` 브랜치 `feat/wave-role-board`에는 미커밋 변경이 남아 있다. 핵심 구현은 완료되어 테스트 29개가 통과했지만, 이미 떠 있는 Hermes/Wave pane은 plugin/CLI 코드를 메모리에 로드했을 수 있으므로 새 동작을 확실히 쓰려면 해당 pane을 재시작해야 한다. 다음 세션은 `git diff`를 검토한 뒤, 필요한 경우 CLI/gateway 재시작/스모크 테스트 후 커밋 여부를 사용자에게 확인하면 된다.
+Hermes CLI 하단 status bar에 token-tracker 기반 daily usage 표시를 붙이는 작업을 완료했다. 현재 구현은 `hermes-codex` 실행 시 모델명 바로 옆에 Codex daily 사용률 바를, `hermes-claude` 실행 시 Claude Code daily 사용률 바를 표시한다. 다음 세션은 실행 중인 `hermes-codex` / `hermes-claude` 세션을 재시작해 실제 TUI에서 표시가 보이는지 육안 확인하면 된다.
 
 ## 2. 가장 최근 작업 (100% 보존)
-
-### 2.1 Wave role-board 내부 라우팅 문구 노출 버그 수정
-
-문제:
-- 사용자-facing 답변/T1/Slack에 내부 문구가 섞여 나오는 문제가 있었다.
-- 노출 문구 예:
-  ```text
-  Wave role-board routing for this turn:
-  - mode: project
-  - scope: project
-  - reason: project_work_trigger
-  - needs_project: False
-  - recommended_action: use_project_path_and_emit_progress_at_stage_boundaries
-  Rules: chat/scratch mode should avoid automatic four-subagent calls ...
-  ```
-- 원인: `wave-role-board` plugin의 `pre_llm_call` hook이 내부 routing block을 `{"context": ...}`로 반환했고, Hermes는 이 context를 current turn user message 뒤에 붙인다. 모델이 이 block을 실제 사용자 입력처럼 보고 최종 답변에 그대로 인용할 수 있었다.
+요청: “대화창의 매번 마지막에 오는 gpt-5.5 옆에다가 가로바를 하나 만들고, 그 가로바에 daily limit 사용 퍼센트를 표시. 사용량이 늘수록 바가 채워지고, 바 옆에는 숫자+% 표시. hermes-codex는 Codex 사용량, hermes-claude는 Claude 사용량.”
 
 수정 파일:
-- `/Users/392yes/.hermes/plugins/wave-role-board/__init__.py`
-- `/Users/392yes/.hermes/hermes-agent/plugins/wave-role-board/__init__.py`
-- `/Users/392yes/.hermes/hermes-agent/tests/plugins/test_wave_role_board_plugin.py`
+- `/Users/392yes/.hermes/hermes-agent/cli.py`
+- `/Users/392yes/.hermes/hermes-agent/tests/cli/test_cli_status_bar.py`
 
-수정 내용:
-- user-local plugin과 repo bundled plugin 둘 다 `_pre_llm_call(...)`에서 routing context를 반환하지 않게 변경했다.
-- T2 notes/stage marker 동작은 유지한다.
-- 핵심 주석:
-  ```python
-  # Do not return routing text as pre_llm_call context.  Hermes injects
-  # plugin context into the user message, and LLMs can echo that block in
-  # T1/Slack replies.  The route is used only for T2 notes/stage markers;
-  # user-facing replies must never include the internal
-  # "Wave role-board routing for this turn" block.
-  return None
-  ```
-- 테스트명 변경:
-  - 기존: `test_pre_llm_call_injects_mode_context_and_notes`
-  - 변경: `test_pre_llm_call_emits_mode_notes_without_user_context`
-- 새 테스트 기대값:
-  - `ret is None`
-  - T2 messages는 4개 생성
-  - `messages.jsonl`에는 `Wave role-board routing` 문구가 없음
+구현 세부사항:
+- `token-tracker`가 uv tool로 설치된 Python 경로를 사용한다:
+  - `/Users/392yes/.local/share/uv/tools/token-tracker/bin/python`
+- Hermes status bar 렌더가 자주 호출되므로 token-tracker 스캔은 직접 렌더 경로에서 블로킹하지 않고, 백그라운드 refresh + 60초 캐시로 처리했다.
+- daily limit 기준은 token-tracker 내부의 `aggregate_daily()` + `calculate_p90()` 결과를 사용한다.
+- `HERMES_LEAD_MODE`로 표시 대상을 구분한다:
+  - `HERMES_LEAD_MODE=hugo-lead` → Codex daily usage
+  - `HERMES_LEAD_MODE=clara-lead` → Claude Code daily usage
+- 기존 “Codex day 2%” / “CC day 64%” 텍스트형 표시를 제거하고, 모델명 바로 뒤에 바 형태로 표시하도록 바꿨다.
+- 바 렌더링:
+  - 10칸: `[██████░░░░] 64%`
+  - 0%보다 크지만 10칸 rounding 상 0칸이 되는 낮은 사용률도 최소 1칸 표시하도록 처리했다.
+  - 예: `2%` → `[█░░░░░░░░░] 2%`
+- wide/medium/narrow text fallback와 prompt_toolkit fragment 경로 모두 모델명 옆에 같은 daily usage 바가 붙도록 처리했다.
 
-검증 명령 및 결과:
+실제 검증 명령과 결과:
+
 ```bash
-venv/bin/python -m pytest tests/plugins/test_wave_role_board_plugin.py -q -o 'addopts='
+./venv/bin/python -m py_compile cli.py tests/cli/test_cli_status_bar.py
 ```
-결과:
+- 결과: 통과, 출력 없음
+
+```bash
+./venv/bin/python -m pytest tests/cli/test_cli_status_bar.py -q -o 'addopts='
+```
+- 결과:
 ```text
-.......                                                                  [100%]
-7 passed in 0.14s
+..............................................                           [100%]
+46 passed in 0.96s
 ```
 
-추가 직접 검증:
+실제 렌더 문자열 확인:
+
 ```bash
-PYTHONPATH=/Users/392yes/.hermes/plugins/wave-role-board /Users/392yes/.hermes/hermes-agent/venv/bin/python - <<'PY'
-import importlib.util, sys, types, os, json, tempfile
-from pathlib import Path
-home=Path(tempfile.mkdtemp())/'.hermes'; home.mkdir(); os.environ['HERMES_HOME']=str(home); os.environ.pop('WAVE_HUB_HOME',None)
-if 'hermes_plugins' not in sys.modules:
-    ns=types.ModuleType('hermes_plugins'); ns.__path__=[]; sys.modules['hermes_plugins']=ns
-p=Path('/Users/392yes/.hermes/plugins/wave-role-board/__init__.py')
-spec=importlib.util.spec_from_file_location('hermes_plugins.wave_role_board_user', p, submodule_search_locations=[str(p.parent)])
-mod=importlib.util.module_from_spec(spec); mod.__package__='hermes_plugins.wave_role_board_user'; mod.__path__=[str(p.parent)]; sys.modules['hermes_plugins.wave_role_board_user']=mod; spec.loader.exec_module(mod)
-ret=mod._pre_llm_call(user_message='프로젝트 작업 진행해줘')
-print('ret=', ret)
-print('messages_exists=', (home/'wave-hub'/'messages.jsonl').exists())
+HERMES_LEAD_MODE=hugo-lead ./venv/bin/python - <<'PY'
+from datetime import datetime
+from types import SimpleNamespace
+import cli
+cli._refresh_agent_daily_usage_status('codex')
+c=cli.HermesCLI.__new__(cli.HermesCLI)
+c.model='gpt-5.5'; c.session_start=datetime.now(); c.conversation_history=[]; c.agent=SimpleNamespace(model='gpt-5.5',session_input_tokens=0,session_output_tokens=0,session_cache_read_tokens=0,session_cache_write_tokens=0,session_prompt_tokens=0,session_completion_tokens=0,session_total_tokens=0,session_api_calls=0,context_compressor=SimpleNamespace(last_prompt_tokens=0,context_length=200000,compression_count=0)); c._prompt_start_time=None; c._prompt_duration=0; c._last_turn_finished_at=None; c._background_tasks={};
+print(c._build_status_bar_text(width=160))
 PY
 ```
-결과:
+- 결과:
 ```text
-ret= None
-messages_exists= False
+⚕ gpt-5.5 [█░░░░░░░░░] 2% │ 0/200K │ 0% │ 0s │ ⏲ 0s
 ```
 
-최종 통합 검증:
 ```bash
-/Users/392yes/.hermes/hermes-agent/venv/bin/python -m py_compile /Users/392yes/.hermes/plugins/wave-role-board/__init__.py plugins/wave-role-board/__init__.py && venv/bin/python -m pytest tests/plugins/test_wave_role_board_plugin.py tests/gateway/test_claude_code_bridge.py tests/gateway/test_orchestrator_modes.py -q -o 'addopts='
+HERMES_LEAD_MODE=clara-lead ./venv/bin/python - <<'PY'
+from datetime import datetime
+from types import SimpleNamespace
+import cli
+cli._refresh_agent_daily_usage_status('claude-code')
+c=cli.HermesCLI.__new__(cli.HermesCLI)
+c.model='gpt-5.5'; c.session_start=datetime.now(); c.conversation_history=[]; c.config={}; c.agent=SimpleNamespace(model='gpt-5.5',session_input_tokens=0,session_output_tokens=0,session_cache_read_tokens=0,session_cache_write_tokens=0,session_prompt_tokens=0,session_completion_tokens=0,session_total_tokens=0,session_api_calls=0,context_compressor=SimpleNamespace(last_prompt_tokens=0,context_length=200000,compression_count=0)); c._prompt_start_time=None; c._prompt_duration=0; c._last_turn_finished_at=None; c._background_tasks={};
+print(c._build_status_bar_text(width=160))
+PY
 ```
-결과:
+- 결과:
 ```text
-.............................                                            [100%]
-29 passed in 1.91s
+⚕ opus-4.8 [██████░░░░] 64% │ 0/200K │ 0% │ 0s │ ⏲ 0s
 ```
 
-주의:
-- 이미 실행 중인 Hermes/Wave pane은 plugin 코드를 메모리에 들고 있을 수 있다. 새 수정 적용을 확실히 하려면 pane 재시작 필요.
+현재 관련 diff stat:
+```text
+ cli.py                           | 283 ++++++++++++++++++++++++++-------------
+ tests/cli/test_cli_status_bar.py |  49 +++++++
+ 2 files changed, 241 insertions(+), 91 deletions(-)
+```
 
 ## 3. 이전 작업 (내림차순 압축)
 
-### 3.1 `hermes-hugo` / `hermes-clara` 로컬 작업대 도입
-
-사용자 요구:
-- 기존 `clara-lead` / `hugo-lead` 전역 모드 전환이 복잡하고, 한 Wave pane에서 lead를 바꾸면 다른 pane도 같이 바뀌는 문제가 있었다.
-- 사용자는 앞으로 `hermes-hugo`와 `hermes-clara`만 구분해서 쓰고 싶다고 결정했다.
-- pane 개수는 제한하면 안 된다. 필요에 따라 1개, 2개, 3개, 4개 이상 가능해야 한다.
-
-구현:
-- 새 파일 생성:
-  - `/Users/392yes/.hermes/hermes-agent/hermes_cli/lead_entrypoints.py`
-- `pyproject.toml` entry point 추가:
-  ```toml
-  hermes-hugo = "hermes_cli.lead_entrypoints:main_hugo"
-  hermes-clara = "hermes_cli.lead_entrypoints:main_clara"
-  ```
-- 실제 사용 가능한 wrapper 생성:
-  - `/Users/392yes/.local/bin/hermes-hugo`
-  - `/Users/392yes/.local/bin/hermes-clara`
-- wrapper 동작:
-  - `hermes-hugo`는 `HERMES_LEAD_MODE=hugo-lead`를 export 후 기존 Hermes 실행
-  - `hermes-clara`는 `HERMES_LEAD_MODE=clara-lead`를 export 후 기존 Hermes 실행
-  - 둘 다 `PYTHONPATH`, `PYTHONHOME` unset 후 `/Users/392yes/.hermes/hermes-agent/venv/bin/hermes` 실행
-
-검증:
+### token-tracker 설치 및 초기 Hermes status bar 연동 검토
+- 사용자가 “token-tracker가 괜찮을거 같네”라고 판단해 설치/검증을 진행했다.
+- 설치 명령:
 ```bash
-which hermes-hugo hermes-clara
-hermes-hugo --version
-hermes-clara --version
-HERMES_LEAD_MODE=clara-lead venv/bin/python - <<'PY'
-from gateway.orchestrator_modes import handle_mode_text
-print(handle_mode_text('휴고 주도 모드'))
-PY
+~/.local/bin/uv tool install token-tracker --python 3.11 --force && ~/.local/bin/tt --version && ~/.local/bin/tt setup
 ```
-결과:
+- 결과:
 ```text
-/Users/392yes/.local/bin/hermes-hugo
-/Users/392yes/.local/bin/hermes-clara
-hugo ok: Hermes Agent v0.14.0 (2026.5.16)
-clara ok: Hermes Agent v0.14.0 (2026.5.16)
-이 세션은 HERMES_LEAD_MODE=clara-lead 로 고정(pinned)되어 있어 모드를 전환하지 않았습니다.
-이 pane은 계속 고정된 lead로 동작하며, 전역 모드 전환은 고정 없이 실행된 세션이나 Slack에서 해주세요.
+tt 0.3.8
+✓ Claude Code statusLine configured
+Restart Claude Code to take effect
+Codex status_line already configured, skipping
 ```
+- 실제 usage 확인:
+```bash
+~/.local/bin/tt daily
+~/.local/bin/tt codex
+~/.local/bin/tt claude
+```
+- 당시 집계 예시:
+  - 전체: Token 약 699.5M, Cost 약 $881, Sessions 387, Messages 4952
+  - Claude Code: Token 약 687.3M, Cost 약 $866, Sessions 368, Messages 4689
+  - Codex: Token 약 12.2M, Cost 약 $14.90, Sessions 19, Messages 263
+- 주의: 처음 `uvx --from token-tracker tt --help`가 첫 실행 setup을 자동 수행해 Claude/Codex 설정을 건드렸다. 이후 안정적인 uv tool 경로로 재설치하고 `tt setup`을 다시 실행해 Claude statusLine 경로를 고정했다.
 
-운영 규칙:
-- `hermes-hugo` = 해당 pane은 Hugo 작업대.
-- `hermes-clara` = 해당 pane은 Clara 작업대.
-- pane 개수 제한 없음.
-- 모든 pane은 default Hermes home을 공유하므로 같은 `/Users/392yes/.hermes/state.db`, memory, skills, Wave active project/context를 본다.
-- 상주성은 pane/session 단위다. 같은 Clara pane은 같은 Claude resume 세션을 재사용한다. 다른 Clara pane은 별도 Claude 세션으로 시작한다.
-
-### 3.2 Clara bridge에 pane/session-local Claude `--resume` 재사용 구현
-
-문제:
-- 기존 `clara-lead` Hermes 경로는 매 턴 새 Claude Code CLI job을 띄워서 Hugo보다 느렸다.
-- 사용자는 Clara도 Hugo처럼 속도와 상주성이 동일한 수준이 되기를 원했다.
-
-수정 파일:
-- `/Users/392yes/.hermes/hermes-agent/gateway/claude_code_bridge.py`
-- `/Users/392yes/.hermes/hermes-agent/cli.py`
-- `/Users/392yes/.hermes/hermes-agent/gateway/run.py`
-- `/Users/392yes/.hermes/hermes-agent/tests/gateway/test_claude_code_bridge.py`
-
-구현:
-- `run_claude_code_bridge_sync(..., bridge_session_key: str | None = None)` 인자 추가.
-- CLI 경로에서 `bridge_session_key=f"cli:{self.session_id}"` 전달.
-- one-shot CLI 경로에서 `bridge_session_key=f"cli:{cli.session_id}"` 전달.
-- gateway 경로에서 `bridge_session_key=f"gateway:{session_id}"` 전달.
-- Claude Code 결과 JSON의 `session_id`를 저장하고, 다음 호출에서 같은 bridge key + 같은 workdir이면 `claude --resume <session_id> -p <prompt> ...`로 실행.
-- 매핑 저장 위치:
-  - `/Users/392yes/.hermes/runtime/claude-code-bridge-sessions.json`
-- 환경 변수로 비활성화 가능:
-  - `HERMES_CLARA_DISABLE_RESUME=1`
-- workdir이 달라지면 기존 Claude session을 resume하지 않게 했다.
-
-테스트 추가:
-- `test_run_bridge_reuses_claude_session_for_same_bridge_key`
-- 첫 호출은 `--resume` 없음.
-- 두 번째 호출은 `--resume session-1` 포함.
-- session map은 두 번째 결과의 `session-2`로 업데이트됨.
-
-주의/한계:
-- Claude 계정 월 사용 한도 429가 걸려 있으면 실제 Clara 응답은 여전히 실패한다. 구조적 상주성은 구현됐지만 체감 속도 검증은 Claude 한도 해제 후 가능하다.
-- 사용자가 “hermes-clara도 hermes-hugo처럼 속도가 똑같이 잘 나와야 한다”고 요청했지만, 실제 속도는 Claude Code CLI/구독/한도/모델 상태에 의존한다. 구현상으로는 매턴 fresh job 비용을 줄였다.
-
-### 3.3 기존 `/hugo-lead`, `/clara-lead` 정리 방향
-
-사용자 결정:
-- 로컬 Wave 병행 작업에서는 `hermes-hugo` / `hermes-clara`만 쓰기로 했다.
-
-구현/정리:
-- slash command 자체는 삭제하지 않았다.
-- 이유: Slack/gateway 전역 모드 전환 호환성이 필요할 수 있기 때문.
-- 대신 `hermes_cli/commands.py` 설명을 legacy global switch로 변경:
-  - `hugo-lead`: `Legacy global switch; prefer hermes-hugo for a fixed Wave pane`
-  - `clara-lead`: `Legacy global switch; prefer hermes-clara for a fixed Wave pane`
-- Claude quota/spend limit 안내도 `/hugo-lead` 전환 대신 `hermes-hugo` 실행 안내로 변경.
-
-### 3.4 세션 초반: Logitech Options+ 제거 및 속도 원인 분석
-
-- Wave T2 로그 확인이 답변 속도에 미치는 영향은 작고, 실제 로컬 CPU 점유 요인으로 Logitech Options+가 높게 나타났었다.
-- 사용자가 Logitech Options+ 삭제를 지시했고, root 권한 명령을 직접 실행했다.
-- 검증 로그 원문:
-  ```text
-  === 실행 시각: 2026년  6월 12일 금요일 21시 04분 34초 KST / 호스트: MacMini.local / 실행자: root ===
-  --- 1. launchd 데몬 해제 ---
-  updater bootout OK
-  RightSight bootout 생략
-  --- 2. 잔존 프로세스 강제 종료 ---
-  남은 프로세스 없음
-  --- 3. 파일 삭제 ---
-  rm 완료 (exit=0)
-  --- 4. 자체 검증 ---
-  === 결과: 삭제 완료 (잔존 0건) ===
-  ```
-- 그 뒤 Clara/Hugo 응답 타이밍을 비교했고, 핵심 차이는 gateway가 아니라 Clara가 매 턴 fresh Claude CLI job으로 뜨는 구조와 모델 왕복 루프에 있음을 설명했다.
+### GitHub usage tracker 후보 조사
+- 사용자가 GitHub에서 Codex/Claude Code usage 체크 프로그램을 찾아달라고 요청했다.
+- web_search backend가 `Firecrawl search failed: 'NoneType' object has no attribute 'status_code'`로 반복 실패해서 GitHub API/NPM metadata 조회로 대체했다.
+- 확인한 주요 후보:
+  - `ccusage/ccusage` — 약 16k stars, Claude Code/Codex/Hermes 등 지원
+  - `tddworks/ClaudeBar` — macOS 메뉴바 quota app
+  - `stormzhang/token-tracker` — Claude Code + Codex statusLine/dashboard
+  - `juliantanx/aiusage` — local-first dashboard
+  - `Nihondo/AgentLimits` — macOS menu bar/widgets
+- 결론: 사용자는 token-tracker를 선택했다.
 
 ## 4. 사용자 결정사항·승인 내역 (무압축)
-
-- 2026-06-13: 사용자는 로컬 Wave 작업대 구분을 기존 `clara-lead` / `hugo-lead` 중심이 아니라 `hermes-hugo` / `hermes-clara` 중심으로 단순화하기로 결정했다.
-- 2026-06-13: 사용자는 pane 개수를 2개로 제한하지 말라고 명확히 정정했다. 필요에 따라 하나만 쓸 수도 있고, 세 개/네 개 이상도 가능해야 한다.
-- 2026-06-13: 사용자는 `hermes-clara`도 `hermes-hugo`처럼 속도와 상주성이 잘 나와야 하며, 둘 다 완벽히 같은 memory/state를 공유해야 한다고 요구했다.
-- 2026-06-13: 사용자는 기존 `clara-lead` / `hugo-lead`가 필요 없으면 정리하고 `hermes-hugo` / `hermes-clara` 방식으로 진행하라고 승인했다.
-- 2026-06-13: 사용자는 user-facing 답변에 노출되는 `Wave role-board routing for this turn...` 내부 문구를 마저 수정하라고 지시했고, 수정 완료했다.
-- 2026-06-12: 사용자는 Logitech Options+ 완전 삭제를 지시했고, 관리자 권한 명령을 직접 실행했다. 삭제 검증 결과 잔존 0건이었다.
+- 2026-06-17: 사용자는 Codex/Claude Code usage tracking 후보 중 `token-tracker`가 괜찮다고 결정했다.
+- 2026-06-17: 사용자는 Hermes 내부 status bar에 daily 사용량을 표시하는 방향을 요청했다.
+- 2026-06-17: 사용자는 최종적으로 “모델명(gpt-5.5/opus-4.8) 옆에 가로바 + 숫자 퍼센트” 형태를 요구했다.
+- 2026-06-17: 삭제/배포/커밋/푸시 승인 없음. 이번 세션에서는 로컬 파일 수정과 테스트만 수행했다.
 
 ## 5. 미완료 작업 / 다음 액션
-
-- [ ] 새 Hermes/Wave pane을 재시작해 `hermes-hugo` / `hermes-clara`가 실제 Wave 환경에서 기대대로 동작하는지 스모크 테스트한다.
-- [ ] Claude monthly spend limit 429가 해제된 뒤 `hermes-clara` 실제 응답 속도와 `--resume` 재사용 효과를 측정한다.
-- [ ] 현재 미커밋 변경 전체를 `git diff`로 리뷰하고, 필요한 경우 테스트 범위를 넓힌 뒤 커밋 여부를 사용자에게 확인한다.
-- [ ] user-local plugin `/Users/392yes/.hermes/plugins/wave-role-board/__init__.py`와 repo bundled plugin `/Users/392yes/.hermes/hermes-agent/plugins/wave-role-board/__init__.py`의 source split을 유지할지/정리할지 결정한다.
-- [ ] Slack/gateway 전역 `/hugo-lead`, `/clara-lead` 호환성을 계속 유지할지, 도움말에서 더 숨길지 사용자에게 확인한다.
+- [ ] 실행 중인 `hermes-codex` / `hermes-claude` CLI 세션을 재시작해 실제 TUI 하단 status bar에서 가로바가 보이는지 확인한다.
+- [ ] 필요하면 bar width(현재 10칸), 색상 threshold, 낮은 퍼센트 최소 1칸 표시 정책을 사용자 취향에 맞게 조정한다.
+- [ ] 이번 변경을 커밋할지 여부는 사용자 승인 후 결정한다. 현재 커밋/푸시 없음.
+- [ ] 기존에 남아 있던 다른 uncommitted 변경(`gateway/claude_code_bridge.py`, `tests/cli/test_cli_terminal_response_sanitizer.py`, 백업 파일 등)과 이번 status bar 변경을 섞어 커밋하지 않도록 분리 검토한다.
 
 ## 6. 주의사항·함정
-
-- 현재 git working tree에는 이번 세션 변경 외에 이미 존재하던 변경도 섞여 있을 수 있다. 절대 무턱대고 reset하지 말 것.
-- 현재 `git status --short`:
-  ```text
-   M agent/skill_commands.py
-   M cli.py
-   M gateway/claude_code_bridge.py
-   M gateway/orchestrator_modes.py
-   M gateway/run.py
-   M hermes_cli/commands.py
-   M plugins/wave-role-board/__init__.py
-   M pyproject.toml
-   M tests/agent/test_skill_commands.py
-   M tests/gateway/test_claude_code_bridge.py
-   M tests/gateway/test_orchestrator_modes.py
-   M tests/plugins/test_wave_role_board_plugin.py
-  ?? hermes_cli/lead_entrypoints.py
-  ```
-- wrapper scripts `/Users/392yes/.local/bin/hermes-hugo`와 `/Users/392yes/.local/bin/hermes-clara`는 git tracked 파일이 아니다. 다음 세션에서 시스템 상태를 볼 때 이 점을 기억할 것.
-- `hermes-clara`의 “상주성”은 Claude Code CLI의 `--resume` 기반이다. Hugo의 in-process agent와 완전히 같은 내부 구조는 아니다. 하지만 사용자가 원하는 운영 UX는 `hermes-hugo`/`hermes-clara` 작업대 모델로 맞췄다.
-- `HERMES_LEAD_MODE` pin은 전역 mode file을 건드리지 않는다. 현재 전역 파일은 별도로 존재하며, 확인 당시 내용은 다음과 같았다:
-  ```json
-  {"mode": "hugo-lead", "updated_at": "2026-06-12T22:24:34+0900", "source": "codex:claude-spend-limit-fallback"}
-  ```
-- 이미 떠 있는 Hermes/Wave pane은 plugin/CLI 변경을 반영하지 않을 수 있다. 새 동작 검증 전 재시작 필요.
-- Claude monthly spend limit 429가 현재 Clara 실제 경로 검증의 블로커다. 이 상태에서 `hermes-clara`는 구조는 개선됐지만 실제 응답은 실패할 수 있다.
-- user message에 보이는 `Wave role-board routing...` block은 원래 내부 라우팅 힌트였고, 이제 plugin에서는 context로 반환하지 않도록 수정했다. 단, 이미 세션 기록에 남은 과거 메시지에는 해당 문구가 존재한다.
+- 현재 브랜치: `remove-t2-role-board-cleanup`, HEAD: `d55b0c606`.
+- 현재 repo 전체 `git status --short`:
+```text
+ M cli.py
+ M gateway/claude_code_bridge.py
+ M handover.md
+ M tests/cli/test_cli_status_bar.py
+ M tests/cli/test_cli_terminal_response_sanitizer.py
+?? gateway/claude_code_bridge.py.bak-20260614
+```
+- 이번 요청 범위로 직접 수정한 핵심 파일은 `cli.py`, `tests/cli/test_cli_status_bar.py`, 그리고 이 handoff를 위해 덮어쓴 `handover.md`다. 다른 변경들은 이전 세션/다른 작업의 잔여 변경이므로 무심코 섞어 커밋하면 안 된다.
+- `handover.md`는 이 스킬 규칙에 따라 canonical으로 덮어쓴다. 덮어쓰기 자체가 의도된 동작이다.
+- token-tracker daily percentage는 실제 provider quota API가 아니라 로컬 로그 기반 P90 daily token 기준이다. 사용자가 “daily limit”이라고 부르는 값은 현재 구현상 token-tracker의 P90 daily token limit이다.
+- 첫 렌더 직후에는 백그라운드 refresh가 아직 끝나지 않아 usage bar가 잠깐 비어 있을 수 있다. 60초 캐시/비동기 갱신 구조다.
+- Hugo/Clara 공통 다음 시작점은 이 `handover.md`와 Obsidian 사본이다. Claude Code native `--resume` 또는 Hermes pane-local resume은 보조 수단이다. 다음 세션에서는 repo root에서 `/session-resume`을 실행해 이 파일을 읽는 것이 기준이다.
