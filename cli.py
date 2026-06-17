@@ -186,7 +186,7 @@ def _refresh_agent_daily_usage_status(agent_id: str) -> None:
             raise RuntimeError("token-tracker uv tool Python not found")
         code = r'''
 import json, sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from src.adapters import claude, codex
 from src.analyzer.aggregator import aggregate_daily
 from src.analyzer.blocks import analyze_blocks, calculate_p90
@@ -198,14 +198,18 @@ if loader is None:
     raise SystemExit(0)
 entries = loader.load_entries()
 daily = aggregate_daily(entries)
-today_key = datetime.now(UTC).date().isoformat()
+now = datetime.now(UTC)
+today_key = now.date().isoformat()
 today = next((d for d in daily if d.date == today_key), None)
 p90 = calculate_p90(daily)
 limit = int(getattr(p90, "token_limit", 0) or 0)
 used = int(getattr(today, "total_tokens", 0) or 0) if today else 0
 pct = (used / limit * 100) if limit > 0 else None
-# Active 5-hour rate-limit block reset time (when the rolling quota renews).
-reset_at = None
+# The percentage is a UTC calendar-day total, so always provide the next
+# daily rollover.  If token-tracker also has an active rolling block, that
+# is more precise for active rate-limit recovery and remains preferred.
+daily_reset_at = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).isoformat()
+reset_at = daily_reset_at
 try:
     blocks = analyze_blocks(entries)
     active = next(
@@ -216,7 +220,7 @@ try:
     if active is not None and getattr(active, "end_time", None) is not None:
         reset_at = active.end_time.isoformat()
 except Exception:
-    reset_at = None
+    reset_at = daily_reset_at
 print(json.dumps({"agent_id": agent_id, "pct": pct, "used": used, "limit": limit, "reset_at": reset_at}))
 '''
         completed = subprocess.run(
@@ -2724,6 +2728,59 @@ def _strip_leaked_bracketed_paste_wrappers(text: str) -> str:
     return text
 
 
+_TERMINAL_RESPONSE_FEED_COMPLETE_RE = re.compile(
+    r"(?:"
+    r"\x1b\[\d+;\d+R"
+    r"|\^\[\[\d+;\d+R"
+    r"|\x1b\[<\d+;\d+;\d+[Mm]"
+    r"|\^\[\[<\d+;\d+;\d+[Mm]"
+    r"|<\d+;\d+;\d+[Mm]"
+    r")"
+)
+_TERMINAL_RESPONSE_FEED_PREFIX_RE = re.compile(
+    r"(?:"
+    r"\x1b(?:\[\d*(?:;\d*)?|\[<\d*(?:;\d*){0,2})?"
+    r"|\^\[(?:\[\d*(?:;\d*)?|\[<\d*(?:;\d*){0,2})?"
+    r"|<\d+(?:;\d*){0,2}"
+    r")"
+)
+_TERMINAL_RESPONSE_FEED_MAX_PENDING = 48
+
+
+def _strip_terminal_response_sequences_from_feed(
+    data: str,
+    pending: str = "",
+) -> tuple[str, str]:
+    """Drop CPR/SGR terminal replies before prompt_toolkit turns them into text.
+
+    The submit-time sanitizer catches leaked ``ESC[row;colR`` after the user
+    presses Enter, but in terminals such as VS Code's integrated terminal the
+    bytes can be rendered in the live prompt first as ``^[[50;1R``. Filtering
+    at the vt100 feed boundary prevents those terminal replies from ever
+    entering the editable buffer. ``pending`` carries a short incomplete suffix
+    so replies split across reads are removed once complete.
+    """
+    if not data and not pending:
+        return "", ""
+
+    combined = f"{pending}{data}"
+    if not combined:
+        return "", ""
+
+    cleaned = _TERMINAL_RESPONSE_FEED_COMPLETE_RE.sub("", combined)
+
+    next_pending = ""
+    max_scan = min(len(cleaned), _TERMINAL_RESPONSE_FEED_MAX_PENDING)
+    for size in range(max_scan, 1, -1):
+        suffix = cleaned[-size:]
+        if _TERMINAL_RESPONSE_FEED_PREFIX_RE.fullmatch(suffix):
+            next_pending = suffix
+            cleaned = cleaned[:-size]
+            break
+
+    return cleaned, next_pending
+
+
 def _apply_bracketed_paste_timeout_patch() -> None:
     """Patch prompt_toolkit to recover from torn bracketed-paste sequences.
 
@@ -2794,6 +2851,11 @@ def _apply_bracketed_paste_timeout_patch() -> None:
                 # Normal mode — re-inline prompt_toolkit's normal feed path.
                 # Calling the original feed here would double-buffer after the
                 # bracketed-paste entry transition.
+                pending = getattr(self_parser, "_hermes_terminal_response_pending", "")
+                data, pending = _strip_terminal_response_sequences_from_feed(data, pending)
+                setattr(self_parser, "_hermes_terminal_response_pending", pending)
+                if not data:
+                    return
                 for i, c in enumerate(data):
                     if self_parser._in_bracketed_paste:
                         _patched_vt100_feed(self_parser, data[i:])
@@ -4438,7 +4500,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
-                parts = [f"⚕ {display_model_short}{usage_text}", percent_label]
+                # If an external-agent usage bar is present, avoid showing a
+                # second percentage for context pressure in the same compact
+                # footer. Two adjacent percentages look like conflicting quota
+                # readings.
+                parts = [f"⚕ {display_model_short}{usage_text}"]
+                if agent_usage_percent is None:
+                    parts.append(percent_label)
                 compressions = snapshot.get("compressions", 0)
                 if compressions:
                     parts.append(f"🗜️ {compressions}")
@@ -4461,7 +4529,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {display_model_short}{usage_text}", context_label, percent_label]
+            # Context pressure shown once as the raw token count (context_label);
+            # the redundant percentage is omitted to avoid two context readings.
+            parts = [f"⚕ {display_model_short}{usage_text}", context_label]
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -4527,9 +4597,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", display_model_short),
                         *usage_frags,
-                        ("class:status-bar-dim", " · "),
-                        (self._status_bar_context_style(percent), percent_label),
                     ]
+                    if agent_usage_percent is None:
+                        frags.extend([
+                            ("class:status-bar-dim", " · "),
+                            (self._status_bar_context_style(percent), percent_label),
+                        ])
                     if compressions:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -4555,7 +4628,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     else:
                         context_label = "ctx --"
 
-                    bar_style = self._status_bar_context_style(percent)
                     compressions = snapshot.get("compressions", 0)
                     bg_count = snapshot.get("active_background_tasks", 0)
                     bg_proc_count = snapshot.get("active_background_processes", 0)
@@ -4565,11 +4637,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         *usage_frags,
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
-                        ("class:status-bar-dim", " │ "),
-                        (bar_style, self._build_context_bar(percent)),
-                        ("class:status-bar-dim", " "),
-                        (bar_style, percent_label),
                     ]
+                    # Context pressure is shown once, as the raw token count
+                    # (e.g. 172K/1M). The redundant bar+% graphic is intentionally
+                    # omitted so the footer never shows two context indicators.
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))

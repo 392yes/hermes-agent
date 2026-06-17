@@ -5,7 +5,10 @@ leak into the input buffer after terminal resize storms or multiplexer
 tab switches — see issue #14692.
 """
 
-from cli import _strip_leaked_terminal_responses
+from cli import (
+    _strip_leaked_terminal_responses,
+    _strip_terminal_response_sequences_from_feed,
+)
 
 
 class TestStripLeakedTerminalResponses:
@@ -79,3 +82,42 @@ class TestStripLeakedTerminalResponses:
     def test_does_not_strip_regular_angle_bracket_text(self):
         text = "render <div class='hero'> literal"
         assert _strip_leaked_terminal_responses(text) == text
+
+
+class TestStripTerminalResponseSequencesFromFeed:
+    def test_strips_complete_cpr_before_prompt_buffer(self):
+        cleaned, pending = _strip_terminal_response_sequences_from_feed("hello\x1b[50;1Rworld")
+        assert cleaned == "helloworld"
+        assert pending == ""
+
+    def test_strips_visible_cpr_before_prompt_buffer(self):
+        cleaned, pending = _strip_terminal_response_sequences_from_feed("^[[50;1R")
+        assert cleaned == ""
+        assert pending == ""
+
+    def test_strips_split_cpr_across_reads(self):
+        cleaned, pending = _strip_terminal_response_sequences_from_feed("hello\x1b[50;")
+        assert cleaned == "hello"
+        assert pending == "\x1b[50;"
+
+        cleaned, pending = _strip_terminal_response_sequences_from_feed("1Rworld", pending)
+        assert cleaned == "world"
+        assert pending == ""
+
+    def test_releases_non_matching_incomplete_prefix(self):
+        cleaned, pending = _strip_terminal_response_sequences_from_feed("\x1b[50;")
+        assert cleaned == ""
+        assert pending == "\x1b[50;"
+
+        cleaned, pending = _strip_terminal_response_sequences_from_feed("x", pending)
+        assert cleaned == "\x1b[50;x"
+        assert pending == ""
+
+    def test_strips_split_sgr_mouse_report(self):
+        cleaned, pending = _strip_terminal_response_sequences_from_feed("abc\x1b[<65;1;")
+        assert cleaned == "abc"
+        assert pending == "\x1b[<65;1;"
+
+        cleaned, pending = _strip_terminal_response_sequences_from_feed("49Mdef", pending)
+        assert cleaned == "def"
+        assert pending == ""

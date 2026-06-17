@@ -770,6 +770,53 @@ class TestIdleSinceLastTurn:
         assert calls == ["codex"]
         assert "gpt-5.5 [█░░░░░░░░░] 12%" in text
 
+    def test_status_bar_does_not_show_context_percent_when_usage_bar_present(self, monkeypatch):
+        cli_obj = _attach_agent(
+            _make_cli("gpt-5.5"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        monkeypatch.setenv("HERMES_LEAD_MODE", "hugo-lead")
+        monkeypatch.setattr(
+            cli_module,
+            "_get_agent_daily_usage_status_cached",
+            lambda agent_id: {"label": "Codex", "percent": 12},
+        )
+
+        text = cli_obj._build_status_bar_text(width=160)
+
+        assert "gpt-5.5 [█░░░░░░░░░] 12%" in text
+        assert "12.4K/200K" in text
+        assert "│ 6%" not in text
+        assert text.count("%") == 1
+
+    def test_compact_status_bar_does_not_show_context_percent_when_usage_bar_present(self, monkeypatch):
+        cli_obj = _attach_agent(
+            _make_cli("gpt-5.5"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        monkeypatch.setenv("HERMES_LEAD_MODE", "hugo-lead")
+        monkeypatch.setattr(
+            cli_module,
+            "_get_agent_daily_usage_status_cached",
+            lambda agent_id: {"label": "Codex", "percent": 12},
+        )
+
+        text = cli_obj._build_status_bar_text(width=70)
+
+        assert "[█░░░░░░░░░] 12%" in text
+        assert "6%" not in text
+        assert text.count("%") == 1
+
     def test_clara_lead_status_bar_uses_claude_daily_usage(self, monkeypatch):
         cli_obj = _attach_agent(
             _make_cli(),
@@ -845,7 +892,7 @@ class TestIdleSinceLastTurn:
 
         assert "[█░░░░░░░░░] 12% 2h 9m" in text
 
-    def test_status_bar_omits_reset_when_no_active_block(self, monkeypatch):
+    def test_status_bar_uses_daily_rollover_when_no_active_block(self, monkeypatch):
         cli_obj = _attach_agent(
             _make_cli("gpt-5.5"),
             prompt_tokens=10_230,
@@ -859,10 +906,18 @@ class TestIdleSinceLastTurn:
         monkeypatch.setattr(
             cli_module,
             "_get_agent_daily_usage_status_cached",
-            lambda agent_id: {"label": "Codex", "percent": 12, "reset_at": ""},
+            lambda agent_id: {
+                "label": "Codex",
+                "percent": 12,
+                "reset_at": "2026-06-18T00:00:00+00:00",
+            },
+        )
+        monkeypatch.setattr(
+            HermesCLI,
+            "_format_usage_reset_remaining",
+            staticmethod(lambda reset_at, now=None: "6h 30m"),
         )
 
         text = cli_obj._build_status_bar_text(width=160)
 
-        assert "12%" in text
-        assert "h " not in text.split("12%", 1)[1].split("·")[0]
+        assert "[█░░░░░░░░░] 12% 6h 30m" in text
