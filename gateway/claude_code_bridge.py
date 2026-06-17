@@ -62,6 +62,35 @@ _CLAUDE_SESSION_MAP = "runtime/claude-code-bridge-sessions.json"
 _ENV_DISABLE_RESUME = "HERMES_CLARA_DISABLE_RESUME"
 
 
+def _is_resident_startup_execution_error(parsed: dict[str, Any] | None) -> bool:
+    """Return True for Claude Code stream-json startup/runtime failures.
+
+    Claude Code can emit a final ``result`` event with ``subtype``
+    ``error_during_execution`` before any model turn starts.  In that shape the
+    resident process did not produce a useful answer and must be treated like a
+    process/protocol failure so the bridge can invalidate the warm process and
+    retry/fall back instead of surfacing a failed Clara job to the user.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    if str(parsed.get("subtype") or "") != "error_during_execution":
+        return False
+    if int(parsed.get("num_turns") or 0) != 0:
+        return False
+    usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else {}
+    model_usage = parsed.get("modelUsage") if isinstance(parsed.get("modelUsage"), dict) else {}
+    no_tokens = not any(
+        int(usage.get(key) or 0)
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+    )
+    return no_tokens and not model_usage
+
+
 @dataclass
 class ClaudeCodeBridgeResult:
     final_response: str
@@ -317,7 +346,7 @@ def _find_repo_root(start: str | None) -> Path | None:
 
 
 def _latest_obsidian_handoffs(limit: int = 3) -> list[Path]:
-    root = Path.home() / "Library/CloudStorage/OneDrive-Personal/OneSyncFiles/ObsidianVault/AI-Sessions/handover"
+    root = Path.home() / "Library/CloudStorage/OneDrive-Personal/OneSyncFiles/AI-Sessions/handover"
     try:
         files = [p for p in root.glob("*.md") if p.is_file()]
     except Exception:
@@ -576,14 +605,13 @@ def format_token_usage_line(parsed: dict[str, Any] | None) -> str:
                 continue
     if used <= 0 or window <= 0:
         return ""
-    pct = min(100, round(used * 100 / window))
-    filled = min(10, max(0, round(pct / 10)))
-    bar = "█" * filled + "░" * (10 - filled)
     short_model = str(model_name).replace("claude-", "")
+    # Context pressure is reported once, as the raw token count (e.g. 102K/272K).
+    # The redundant bar+% graphic is intentionally omitted so the footer never
+    # shows two context indicators that look like conflicting readings.
     return (
         f"⚕ Clara {short_model} │ "
-        f"{_format_compact_tokens(used)}/{_format_compact_tokens(window)} │ "
-        f"[{bar}] {pct}%"
+        f"{_format_compact_tokens(used)}/{_format_compact_tokens(window)}"
     )
 
 
@@ -871,6 +899,11 @@ def run_claude_code_bridge_sync(
         args.extend(["--model", model])
     if effort:
         args.extend(["--effort", effort])
+    if bcfg.get("strict_mcp"):
+        # Skip filesystem MCP config (memory/jina/context7) — the reviewer role
+        # uses local tools only, and spawning those servers costs ~4s CPU per
+        # cold start. With no --mcp-config flags this loads zero MCP servers.
+        args.append("--strict-mcp-config")
 
     try:
         stdout, stderr, exit_code = _run_claude_subprocess(
@@ -1081,17 +1114,19 @@ def run_claude_code_bridge_resident(
     )
     (log_dir / "prompt.txt").write_text(first_prompt, encoding="utf-8")
 
-    extra_args: list[str] = ["--max-turns", str(max_turns)]
-    if resume_session_id:
-        extra_args[:0] = ["--resume", resume_session_id]
+    base_extra_args: list[str] = ["--max-turns", str(max_turns)]
     if allowed_tools:
-        extra_args.extend(["--allowedTools", allowed_tools])
+        base_extra_args.extend(["--allowedTools", allowed_tools])
     if permission_mode:
-        extra_args.extend(["--permission-mode", permission_mode])
+        base_extra_args.extend(["--permission-mode", permission_mode])
     if model:
-        extra_args.extend(["--model", model])
+        base_extra_args.extend(["--model", model])
     if effort:
-        extra_args.extend(["--effort", effort])
+        base_extra_args.extend(["--effort", effort])
+    if bcfg.get("strict_mcp"):
+        # Same as the cold path: drop MCP servers for the resident process so
+        # each warm claude doesn't keep memory/jina/context7 attached.
+        base_extra_args.append("--strict-mcp-config")
 
     pool_key = "|".join(
         [
@@ -1127,16 +1162,31 @@ def run_claude_code_bridge_resident(
     last_error: Exception | None = None
     for attempt in range(2):
         try:
+            # First attempt may resume the native Claude session for continuity.
+            # If Claude Code returns a zero-turn startup/runtime failure, retry
+            # once without --resume; this sheds a corrupted/stale native session
+            # while preserving the resident bridge as a warm-runtime optimization.
+            attempt_extra_args = list(base_extra_args)
+            if resume_session_id and attempt == 0:
+                attempt_extra_args[:0] = ["--resume", resume_session_id]
             parsed = pool.run_turn(
                 key=pool_key,
                 workdir=workdir,
                 claude_bin=claude_bin,
-                extra_args=extra_args,
+                extra_args=attempt_extra_args,
                 env=_safe_env(),
                 first_prompt=first_prompt,
                 followup_text=message,
                 timeout=timeout,
             )
+            if _is_resident_startup_execution_error(parsed):
+                errors = parsed.get("errors") if isinstance(parsed.get("errors"), list) else []
+                last_error = ResidentTurnError(
+                    "resident startup execution error: " + "; ".join(map(str, errors[:3]))
+                )
+                pool.invalidate(pool_key)
+                parsed = None
+                continue
             break
         except ResidentTurnError as exc:
             # Drop the (possibly wedged) process and retry once with a fresh

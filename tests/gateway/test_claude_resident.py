@@ -184,6 +184,66 @@ def test_bridge_resident_falls_back_to_sync_on_pool_failure(monkeypatch, tmp_pat
     assert out.final_response == "SYNC-FALLBACK"
 
 
+def test_bridge_resident_retries_zero_turn_execution_error_without_resume(monkeypatch, tmp_path):
+    calls = []
+
+    class _FlakyPool:
+        def run_turn(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "num_turns": 0,
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
+                    "modelUsage": {},
+                    "errors": ["G?.startsWith is not a function"],
+                    "session_id": "stale-session",
+                }
+            return {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "복구 완료",
+                "session_id": "fresh-session",
+            }
+
+        def invalidate(self, key):
+            calls.append({"invalidated": key})
+
+    import gateway.claude_resident as resident
+    monkeypatch.setattr(resident, "get_pool", lambda **k: _FlakyPool())
+    monkeypatch.setattr(
+        bridge,
+        "_lookup_claude_session",
+        lambda **k: "stale-session",
+    )
+
+    out = bridge.run_claude_code_bridge_resident(
+        config={"clara_cli": {"enabled": True, "resident_enabled": True, "command": "claude"}},
+        message="작업해줘",
+        context_prompt=None,
+        channel_prompt=None,
+        history=[],
+        hermes_home=tmp_path,
+        bridge_session_key="gateway:s1",
+    )
+
+    run_calls = [c for c in calls if "extra_args" in c]
+    assert len(run_calls) == 2
+    assert run_calls[0]["extra_args"][:2] == ["--resume", "stale-session"]
+    assert "--resume" not in run_calls[1]["extra_args"]
+    assert any("invalidated" in c for c in calls)
+    assert out.exit_code == 0
+    assert "복구 완료" in out.final_response
+
+
 def test_bridge_resident_success_formats_slack_text(monkeypatch, tmp_path):
     result_event = {
         "type": "result", "subtype": "success", "is_error": False,
