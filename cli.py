@@ -37,17 +37,18 @@ import tempfile
 import time
 import uuid
 import textwrap
+import threading
 from collections import deque
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-_CLAUDE_USAGE_STATUS_CACHE = {"value": "", "checked_at": 0.0, "updating": False}
-_CLAUDE_USAGE_STATUS_LOCK = threading.Lock() if "threading" in globals() else None
+_AGENT_DAILY_USAGE_STATUS_CACHE: Dict[str, Dict[str, Any]] = {}
+_AGENT_DAILY_USAGE_STATUS_LOCK = threading.Lock()
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -90,9 +91,6 @@ try:
     del install_shift_enter_alias, install_ctrl_enter_alias, install_ignored_terminal_sequences
 except Exception:
     pass
-import threading
-if _CLAUDE_USAGE_STATUS_LOCK is None:
-    _CLAUDE_USAGE_STATUS_LOCK = threading.Lock()
 import queue
 
 def CanonicalUsage(*args, **kwargs):
@@ -146,101 +144,125 @@ def format_token_count_compact(*args, **kwargs):
     return f"{value:,}"
 
 
-def _format_claude_code_usage_from_ccusage(data: dict[str, Any]) -> str:
-    """Compact Claude Code usage label for the Wave/Hermes status bar.
+def _token_tracker_python_path() -> Optional[str]:
+    """Return the token-tracker tool Python, if installed via uv tool."""
+    candidates = [
+        Path.home() / ".local" / "share" / "uv" / "tools" / "token-tracker" / "bin" / "python",
+        Path.home() / ".local" / "share" / "uv" / "tools" / "token-tracker" / "Scripts" / "python.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
 
-    Claude Code does not expose the claude.ai web quota percentage through a
-    stable public CLI command.  When available, ccusage gives a reliable local
-    view of the active 5-hour Claude Code billing/rate-limit block.  We show
-    the active block cost and reset time; if there is no active block, return
-    an empty label so the status bar stays clean.
-    """
-    blocks = data.get("blocks") if isinstance(data, dict) else None
-    if not isinstance(blocks, list):
-        return ""
-    active = None
-    for block in reversed(blocks):
-        if isinstance(block, dict) and block.get("isActive") and not block.get("isGap"):
-            active = block
-            break
-    if not active:
-        return ""
-    cost = active.get("costUSD") or 0
+
+def _format_agent_daily_usage_from_token_tracker(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize token-tracker daily P90 usage for the Hermes status bar."""
+    agent_id = str(payload.get("agent_id") or "")
+    pct = payload.get("pct")
+    if pct is None:
+        return {}
     try:
-        cost_label = f"${float(cost):.2f}"
+        pct_int = max(0, min(999, round(float(pct))))
     except Exception:
-        cost_label = "$?"
-    end_text = str(active.get("endTime") or "")
-    reset_label = ""
-    if end_text:
-        try:
-            end_dt = datetime.fromisoformat(end_text.replace("Z", "+00:00")).astimezone()
-            reset_label = end_dt.strftime("%H:%M")
-        except Exception:
-            reset_label = ""
-    if reset_label:
-        return f"CC {cost_label}↺{reset_label}"
-    return f"CC {cost_label}"
+        return {}
+    label = "Codex" if agent_id == "codex" else "CC"
+    reset_at = payload.get("reset_at")
+    reset_at = str(reset_at) if reset_at else ""
+    return {"agent_id": agent_id, "label": label, "percent": pct_int, "reset_at": reset_at}
 
 
-def _refresh_claude_code_usage_status() -> None:
-    """Background refresh for Claude Code usage label.
+def _refresh_agent_daily_usage_status(agent_id: str) -> None:
+    """Background refresh for token-tracker daily usage labels.
 
-    Never raise: status bars must not break the chat UI.
+    The status bar repaints often; never block it on token-tracker log scans.
     """
     import subprocess
 
-    value = ""
+    usage: dict[str, Any] = {}
     try:
+        python = _token_tracker_python_path()
+        if not python:
+            raise RuntimeError("token-tracker uv tool Python not found")
+        code = r'''
+import json, sys
+from datetime import UTC, datetime
+from src.adapters import claude, codex
+from src.analyzer.aggregator import aggregate_daily
+from src.analyzer.blocks import analyze_blocks, calculate_p90
+
+agent_id = sys.argv[1]
+loader = claude if agent_id == "claude-code" else codex if agent_id == "codex" else None
+if loader is None:
+    print(json.dumps({"agent_id": agent_id, "pct": None}))
+    raise SystemExit(0)
+entries = loader.load_entries()
+daily = aggregate_daily(entries)
+today_key = datetime.now(UTC).date().isoformat()
+today = next((d for d in daily if d.date == today_key), None)
+p90 = calculate_p90(daily)
+limit = int(getattr(p90, "token_limit", 0) or 0)
+used = int(getattr(today, "total_tokens", 0) or 0) if today else 0
+pct = (used / limit * 100) if limit > 0 else None
+# Active 5-hour rate-limit block reset time (when the rolling quota renews).
+reset_at = None
+try:
+    blocks = analyze_blocks(entries)
+    active = next(
+        (b for b in reversed(blocks)
+         if getattr(b, "is_active", False) and not getattr(b, "is_gap", False)),
+        None,
+    )
+    if active is not None and getattr(active, "end_time", None) is not None:
+        reset_at = active.end_time.isoformat()
+except Exception:
+    reset_at = None
+print(json.dumps({"agent_id": agent_id, "pct": pct, "used": used, "limit": limit, "reset_at": reset_at}))
+'''
         completed = subprocess.run(
-            [
-                "npx",
-                "--yes",
-                "ccusage@latest",
-                "blocks",
-                "--json",
-                "--timezone",
-                "Asia/Seoul",
-                "--offline",
-            ],
+            [python, "-c", code, agent_id],
             text=True,
             capture_output=True,
             timeout=8,
         )
         if completed.returncode == 0 and completed.stdout.strip():
-            value = _format_claude_code_usage_from_ccusage(json.loads(completed.stdout))
+            usage = _format_agent_daily_usage_from_token_tracker(json.loads(completed.stdout))
     except Exception:
-        value = ""
+        usage = {}
     try:
-        with _CLAUDE_USAGE_STATUS_LOCK:
-            _CLAUDE_USAGE_STATUS_CACHE["value"] = value
-            _CLAUDE_USAGE_STATUS_CACHE["checked_at"] = time.time()
-            _CLAUDE_USAGE_STATUS_CACHE["updating"] = False
+        with _AGENT_DAILY_USAGE_STATUS_LOCK:
+            state = _AGENT_DAILY_USAGE_STATUS_CACHE.setdefault(agent_id, {})
+            state["usage"] = usage
+            state["checked_at"] = time.time()
+            state["updating"] = False
     except Exception:
         pass
 
 
-def _get_claude_code_usage_status_cached() -> str:
-    """Return cached Claude Code usage label and refresh asynchronously.
-
-    The prompt/status bar is rendered often; never block it on npx/ccusage.
-    """
+def _get_agent_daily_usage_status_cached(agent_id: str) -> dict[str, Any]:
+    """Return cached token-tracker daily usage and refresh asynchronously."""
+    if agent_id not in {"claude-code", "codex"}:
+        return {}
     try:
         now = time.time()
-        with _CLAUDE_USAGE_STATUS_LOCK:
-            value = str(_CLAUDE_USAGE_STATUS_CACHE.get("value") or "")
-            checked_at = float(_CLAUDE_USAGE_STATUS_CACHE.get("checked_at") or 0.0)
-            updating = bool(_CLAUDE_USAGE_STATUS_CACHE.get("updating"))
+        with _AGENT_DAILY_USAGE_STATUS_LOCK:
+            state = _AGENT_DAILY_USAGE_STATUS_CACHE.setdefault(
+                agent_id, {"usage": {}, "checked_at": 0.0, "updating": False}
+            )
+            usage = dict(state.get("usage") or {})
+            checked_at = float(state.get("checked_at") or 0.0)
+            updating = bool(state.get("updating"))
             if now - checked_at > 60 and not updating:
-                _CLAUDE_USAGE_STATUS_CACHE["updating"] = True
+                state["updating"] = True
                 threading.Thread(
-                    target=_refresh_claude_code_usage_status,
+                    target=_refresh_agent_daily_usage_status,
+                    args=(agent_id,),
                     daemon=True,
-                    name="claude-usage-status-refresh",
+                    name=f"{agent_id}-daily-usage-status-refresh",
                 ).start()
-            return value
+            return usage
     except Exception:
-        return ""
+        return {}
 
 
 def is_table_divider(*args, **kwargs):
@@ -3926,6 +3948,67 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         filled = round((safe_percent / 100) * width)
         return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
 
+    def _build_daily_usage_bar(self, percent_used: Optional[int], width: int = 10) -> str:
+        """Return the compact daily-limit usage bar shown beside the model."""
+        display_percent = max(0, min(999, int(percent_used or 0)))
+        fill_percent = max(0, min(100, display_percent))
+        filled = round((fill_percent / 100) * width)
+        if display_percent > 0 and filled == 0:
+            filled = 1
+        return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
+
+    @staticmethod
+    def _format_usage_reset_remaining(reset_at_iso, now=None) -> str:
+        """Time until the active rate-limit block renews, e.g. ``2h 9m``.
+
+        ``reset_at_iso`` is the active 5-hour usage block's end time (ISO 8601),
+        i.e. when the rolling quota that drives the daily-usage percentage next
+        resets.  Returns ``""`` when there is no active block or it has already
+        reset, so the status bar simply omits the hint in that case.
+        """
+        if not reset_at_iso:
+            return ""
+        try:
+            reset_dt = datetime.fromisoformat(str(reset_at_iso).replace("Z", "+00:00"))
+        except Exception:
+            return ""
+        if reset_dt.tzinfo is None:
+            reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        remaining = (reset_dt - current).total_seconds()
+        if remaining <= 0:
+            return ""
+        total_minutes = int(remaining // 60)
+        hours, minutes = divmod(total_minutes, 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        return f"{minutes}m"
+
+    def _daily_usage_fragments(self, percent_used: Optional[int], width: int = 10, reset_at: str = ""):
+        """Styled daily-limit bar fragments for the status bar."""
+        if percent_used is None:
+            return []
+        display_percent = max(0, min(999, int(percent_used or 0)))
+        fill_percent = max(0, min(100, display_percent))
+        filled = round((fill_percent / 100) * width)
+        if display_percent > 0 and filled == 0:
+            filled = 1
+        empty = max(0, width - filled)
+        style = self._status_bar_context_style(fill_percent)
+        fragments = [
+            ("class:status-bar-dim", " ["),
+            (style, "█" * filled),
+            ("class:status-bar-dim", "░" * empty),
+            ("class:status-bar-dim", "] "),
+            (style, f"{display_percent}%"),
+        ]
+        remaining = self._format_usage_reset_remaining(reset_at)
+        if remaining:
+            fragments.append(("class:status-bar-dim", f" {remaining}"))
+        return fragments
+
     @staticmethod
     def _format_prompt_elapsed(prompt_start_time: Optional[float], prompt_duration: float, live: bool = False) -> str:
         """Format per-prompt elapsed time for the status bar.
@@ -4004,11 +4087,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             model_short = f"{model_short[:23]}..."
 
         display_model_short = model_short
-        claude_usage_status = ""
+        agent_usage_percent = None
+        agent_usage_label = ""
+        agent_usage_reset_at = ""
         try:
-            from gateway.orchestrator_modes import MODE_CLARA_LEAD, read_mode
+            from gateway.orchestrator_modes import MODE_CLARA_LEAD, MODE_HUGO_LEAD, read_mode
 
-            if read_mode(get_hermes_home()).get("mode") == MODE_CLARA_LEAD:
+            lead_mode_env = os.environ.get("HERMES_LEAD_MODE")
+            lead_mode = lead_mode_env or read_mode(get_hermes_home()).get("mode")
+            if lead_mode == MODE_CLARA_LEAD:
                 claude_model = ""
                 bridge_cfg = (getattr(self, "config", {}) or {}).get("claude_code_cli") or (getattr(self, "config", {}) or {}).get("clara_cli") or {}
                 if isinstance(bridge_cfg, dict):
@@ -4029,9 +4116,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     display_model_short = claude_model_short
                 else:
                     display_model_short = "Claude Code"
-                claude_usage_status = _get_claude_code_usage_status_cached()
+                usage = _get_agent_daily_usage_status_cached("claude-code")
+                agent_usage_percent = usage.get("percent")
+                agent_usage_label = str(usage.get("label") or "")
+                agent_usage_reset_at = str(usage.get("reset_at") or "")
                 if len(display_model_short) > 26:
                     display_model_short = f"{display_model_short[:23]}..."
+            elif lead_mode == MODE_HUGO_LEAD:
+                # Includes the default `hermes` command (no HERMES_LEAD_MODE env):
+                # it resolves to the configured lead mode, which follows the
+                # default model — Codex.
+                usage = _get_agent_daily_usage_status_cached("codex")
+                agent_usage_percent = usage.get("percent")
+                agent_usage_label = str(usage.get("label") or "")
+                agent_usage_reset_at = str(usage.get("reset_at") or "")
         except Exception:
             pass
 
@@ -4040,7 +4138,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "model_name": model_name,
             "model_short": model_short,
             "display_model_short": display_model_short,
-            "claude_usage_status": claude_usage_status,
+            "agent_usage_percent": agent_usage_percent,
+            "agent_usage_label": agent_usage_label,
+            "agent_usage_reset_at": agent_usage_reset_at,
             "duration": format_duration_compact(elapsed_seconds),
             "prompt_elapsed": self._format_prompt_elapsed(
                 getattr(self, "_prompt_start_time", None),
@@ -4320,18 +4420,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             duration_label = snapshot["duration"]
 
             display_model_short = snapshot.get("display_model_short") or snapshot["model_short"]
-            claude_usage_status = str(snapshot.get("claude_usage_status") or "")
+            agent_usage_percent = snapshot.get("agent_usage_percent")
+            usage_text = ""
+            if agent_usage_percent is not None:
+                usage_percent = max(0, min(999, int(agent_usage_percent)))
+                usage_text = f" {self._build_daily_usage_bar(agent_usage_percent)} {usage_percent}%"
+                reset_remaining = self._format_usage_reset_remaining(
+                    snapshot.get("agent_usage_reset_at")
+                )
+                if reset_remaining:
+                    usage_text += f" {reset_remaining}"
 
             yolo_active = self._is_session_yolo_active()
             if width < 52:
-                text = f"⚕ {display_model_short} · {duration_label}"
+                text = f"⚕ {display_model_short}{usage_text} · {duration_label}"
                 if yolo_active:
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
-                parts = [f"⚕ {display_model_short}", percent_label]
-                if claude_usage_status:
-                    parts.append(claude_usage_status)
+                parts = [f"⚕ {display_model_short}{usage_text}", percent_label]
                 compressions = snapshot.get("compressions", 0)
                 if compressions:
                     parts.append(f"🗜️ {compressions}")
@@ -4354,9 +4461,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {display_model_short}", context_label, percent_label]
-            if claude_usage_status:
-                parts.append(claude_usage_status)
+            parts = [f"⚕ {display_model_short}{usage_text}", context_label, percent_label]
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -4393,12 +4498,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             yolo_active = self._is_session_yolo_active()
 
             display_model_short = snapshot.get("display_model_short") or snapshot["model_short"]
-            claude_usage_status = str(snapshot.get("claude_usage_status") or "")
+            agent_usage_percent = snapshot.get("agent_usage_percent")
+            usage_frags = self._daily_usage_fragments(
+                agent_usage_percent,
+                reset_at=str(snapshot.get("agent_usage_reset_at") or ""),
+            )
 
             if width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", display_model_short),
+                    *usage_frags,
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
                 ]
@@ -4416,12 +4526,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", display_model_short),
+                        *usage_frags,
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
                     ]
-                    if claude_usage_status:
-                        frags.append(("class:status-bar-dim", " · "))
-                        frags.append(("class:status-bar-strong", claude_usage_status))
                     if compressions:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -4454,6 +4562,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", display_model_short),
+                        *usage_frags,
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
@@ -4461,9 +4570,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
                     ]
-                    if claude_usage_status:
-                        frags.append(("class:status-bar-dim", " │ "))
-                        frags.append(("class:status-bar-strong", claude_usage_status))
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))

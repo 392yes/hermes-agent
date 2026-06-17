@@ -1,9 +1,27 @@
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+import cli as cli_module
 from cli import HermesCLI
+
+
+@pytest.fixture(autouse=True)
+def _isolate_agent_daily_usage(monkeypatch):
+    """Keep status-bar tests deterministic by never hitting token-tracker.
+
+    The default ``hermes`` command (no HERMES_LEAD_MODE) resolves to the
+    configured lead mode and now fetches Codex daily usage, which would
+    otherwise spawn a background token-tracker scan and leak percentages
+    across tests through the module-level usage cache.  Tests that exercise
+    the usage label override this with their own stub.
+    """
+    monkeypatch.setattr(
+        cli_module, "_get_agent_daily_usage_status_cached", lambda agent_id: {}
+    )
 
 
 def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
@@ -727,3 +745,124 @@ class TestIdleSinceLastTurn:
         cli_obj._prompt_duration = 7.0
         text = cli_obj._build_status_bar_text(width=160)
         assert "✓ 42s" in text
+
+    def test_hugo_lead_status_bar_uses_codex_daily_usage(self, monkeypatch):
+        cli_obj = _attach_agent(
+            _make_cli("gpt-5.5"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        monkeypatch.setenv("HERMES_LEAD_MODE", "hugo-lead")
+        calls = []
+
+        def fake_usage(agent_id):
+            calls.append(agent_id)
+            return {"label": "Codex", "percent": 12}
+
+        monkeypatch.setattr(cli_module, "_get_agent_daily_usage_status_cached", fake_usage)
+
+        text = cli_obj._build_status_bar_text(width=160)
+
+        assert calls == ["codex"]
+        assert "gpt-5.5 [█░░░░░░░░░] 12%" in text
+
+    def test_clara_lead_status_bar_uses_claude_daily_usage(self, monkeypatch):
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        monkeypatch.setenv("HERMES_LEAD_MODE", "clara-lead")
+        calls = []
+
+        def fake_usage(agent_id):
+            calls.append(agent_id)
+            return {"label": "CC", "percent": 64}
+
+        monkeypatch.setattr(cli_module, "_get_agent_daily_usage_status_cached", fake_usage)
+
+        text = cli_obj._build_status_bar_text(width=160)
+
+        assert calls == ["claude-code"]
+        assert "opus-4.8 [██████░░░░] 64%" in text
+
+    def test_format_usage_reset_remaining_hours_and_minutes(self):
+        now = datetime(2026, 6, 17, 16, 0, 0, tzinfo=timezone.utc)
+        reset = (now + timedelta(hours=2, minutes=9, seconds=40)).isoformat()
+        assert HermesCLI._format_usage_reset_remaining(reset, now=now) == "2h 9m"
+
+    def test_format_usage_reset_remaining_minutes_only(self):
+        now = datetime(2026, 6, 17, 16, 0, 0, tzinfo=timezone.utc)
+        reset = (now + timedelta(minutes=45)).isoformat()
+        assert HermesCLI._format_usage_reset_remaining(reset, now=now) == "45m"
+
+    def test_format_usage_reset_remaining_empty_when_past_or_missing(self):
+        now = datetime(2026, 6, 17, 16, 0, 0, tzinfo=timezone.utc)
+        assert HermesCLI._format_usage_reset_remaining("", now=now) == ""
+        past = (now - timedelta(minutes=1)).isoformat()
+        assert HermesCLI._format_usage_reset_remaining(past, now=now) == ""
+
+    def test_format_usage_reset_remaining_handles_naive_and_zulu(self):
+        now = datetime(2026, 6, 17, 16, 0, 0, tzinfo=timezone.utc)
+        zulu = (now + timedelta(hours=1, minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert HermesCLI._format_usage_reset_remaining(zulu, now=now) == "1h 5m"
+
+    def test_status_bar_appends_usage_reset_remaining(self, monkeypatch):
+        cli_obj = _attach_agent(
+            _make_cli("gpt-5.5"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        monkeypatch.setenv("HERMES_LEAD_MODE", "hugo-lead")
+        monkeypatch.setattr(
+            cli_module,
+            "_get_agent_daily_usage_status_cached",
+            lambda agent_id: {
+                "label": "Codex",
+                "percent": 12,
+                "reset_at": "2026-06-17T18:09:00+00:00",
+            },
+        )
+        monkeypatch.setattr(
+            HermesCLI,
+            "_format_usage_reset_remaining",
+            staticmethod(lambda reset_at, now=None: "2h 9m"),
+        )
+
+        text = cli_obj._build_status_bar_text(width=160)
+
+        assert "[█░░░░░░░░░] 12% 2h 9m" in text
+
+    def test_status_bar_omits_reset_when_no_active_block(self, monkeypatch):
+        cli_obj = _attach_agent(
+            _make_cli("gpt-5.5"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        monkeypatch.setenv("HERMES_LEAD_MODE", "hugo-lead")
+        monkeypatch.setattr(
+            cli_module,
+            "_get_agent_daily_usage_status_cached",
+            lambda agent_id: {"label": "Codex", "percent": 12, "reset_at": ""},
+        )
+
+        text = cli_obj._build_status_bar_text(width=160)
+
+        assert "12%" in text
+        assert "h " not in text.split("12%", 1)[1].split("·")[0]
