@@ -962,10 +962,12 @@ def run_claude_code_bridge_sync(
         while marker and body.startswith(marker):
             body = body[len(marker):].lstrip()
         result_text = prefix + body
-    result_text += f"\n\n_Claude Code CLI job: {job_id}_"
-    usage_line = format_token_usage_line(parsed)
-    if usage_line:
-        result_text += f"\n_{usage_line}_"
+    if bool(bcfg.get("show_job_footer", False)):
+        result_text += f"\n\n_Claude Code CLI job: {job_id}_"
+    if bool(bcfg.get("show_token_usage_footer", False)):
+        usage_line = format_token_usage_line(parsed)
+        if usage_line:
+            result_text += f"\n_{usage_line}_"
 
     _write_bridge_ledger(
         hermes_home=hermes_home,
@@ -1017,10 +1019,12 @@ def _format_bridge_result_text(
         while marker and body.startswith(marker):
             body = body[len(marker):].lstrip()
         result_text = prefix + body
-    result_text += f"\n\n_Claude Code CLI job: {job_id}_"
-    usage_line = format_token_usage_line(parsed)
-    if usage_line:
-        result_text += f"\n_{usage_line}_"
+    if bool(bcfg.get("show_job_footer", False)):
+        result_text += f"\n\n_Claude Code CLI job: {job_id}_"
+    if bool(bcfg.get("show_token_usage_footer", False)):
+        usage_line = format_token_usage_line(parsed)
+        if usage_line:
+            result_text += f"\n_{usage_line}_"
     return result_text
 
 
