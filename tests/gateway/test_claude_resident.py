@@ -261,7 +261,7 @@ def test_bridge_resident_success_formats_slack_text(monkeypatch, tmp_path):
     monkeypatch.setattr(resident, "get_pool", lambda **k: _OkPool())
 
     out = bridge.run_claude_code_bridge_resident(
-        config={"clara_cli": {"enabled": True, "resident_enabled": True, "command": "claude"}},
+        config={"clara_cli": {"enabled": True, "resident_enabled": True, "command": "claude", "show_job_footer": True}},
         message="작업해줘",
         context_prompt=None,
         channel_prompt=None,
