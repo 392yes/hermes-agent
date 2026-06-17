@@ -9,6 +9,7 @@ from gateway.claude_code_bridge import (
     extract_explicit_workdir,
     is_claude_code_cli_config,
     resolve_workdir,
+    run_claude_agent_sdk_bridge,
     run_claude_code_bridge_sync,
 )
 
@@ -42,8 +43,12 @@ def test_build_prompt_includes_write_authority_boundary():
         history=[{"role": "user", "content": "이전 요청"}],
         workdir="/tmp/project",
         continuity_context="continuity packet",
+        role_mode="clara-lead",
     )
     assert "Clara/클라라" in prompt
+    assert "Clara is the coding orchestrator, not a review-only role." in prompt
+    assert "answer directly and avoid broad repository/tool exploration unless needed" in prompt
+    assert "inspect, edit, run, verify, and report end-to-end" in prompt
     assert "same operational authority" in prompt
     assert "inspect, edit, run commands" in prompt
     assert "continuity packet" in prompt
@@ -441,3 +446,107 @@ def test_spend_limit_message_points_to_hugo_lead_fallback(tmp_path):
     assert "월 사용 한도" in message
     assert "hermes-hugo" in message
     assert "Hugo/Codex 작업대" in message
+
+
+def test_run_claude_agent_sdk_bridge_uses_sdk_transport(monkeypatch, tmp_path):
+    import gateway.claude_agent_sdk_bridge as sdk_bridge
+
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    calls = {}
+
+    def fake_run_sdk_turn(**kwargs):
+        calls.update(kwargs)
+        return {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "SDK bridge response",
+            "session_id": "sdk-session-1",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+            "delivery": "agent-sdk",
+        }
+
+    monkeypatch.setattr(sdk_bridge, "run_sdk_turn", fake_run_sdk_turn)
+
+    result = run_claude_agent_sdk_bridge(
+        config={
+            "clara_cli": {
+                "enabled": True,
+                "sdk_enabled": True,
+                "workdir": str(workdir),
+                "command": "/usr/local/bin/claude",
+                "max_turns": 3,
+                "sdk_tools": "claude_code",
+                "sdk_setting_sources": "none",
+            }
+        },
+        message="구현 작업으로 처리해줘",
+        context_prompt="ctx",
+        channel_prompt="channel",
+        history=[],
+        hermes_home=tmp_path / "hermes",
+        bridge_session_key="thread-1",
+    )
+
+    assert result.exit_code == 0
+    assert result.raw_json["delivery"] == "agent-sdk"
+    assert result.final_response.startswith("🟪 Clara/클라라 — ")
+    assert "SDK bridge response" in result.final_response
+    assert calls["claude_bin"] == "/usr/local/bin/claude"
+    assert calls["workdir"] == str(workdir)
+    assert calls["tools_mode"] == "claude_code"
+    assert calls["setting_sources"] == "none"
+    assert "구현 작업으로 처리해줘" in calls["prompt"]
+    assert "progress_callback" in calls
+
+
+def test_run_claude_agent_sdk_bridge_forwards_progress_callback(monkeypatch, tmp_path):
+    import gateway.claude_agent_sdk_bridge as sdk_bridge
+
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    progress_events = []
+
+    def fake_run_sdk_turn(**kwargs):
+        kwargs["progress_callback"]("sdk.stream_event", "Claude stream_event: message_start", {"message_type": "StreamEvent"})
+        return {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "OK",
+            "delivery": "agent-sdk",
+        }
+
+    monkeypatch.setattr(sdk_bridge, "run_sdk_turn", fake_run_sdk_turn)
+
+    result = run_claude_agent_sdk_bridge(
+        config={"clara_cli": {"enabled": True, "sdk_enabled": True, "workdir": str(workdir)}},
+        message="구현 작업으로 처리해줘",
+        context_prompt=None,
+        channel_prompt=None,
+        history=[],
+        hermes_home=tmp_path / "hermes",
+        bridge_session_key="thread-1",
+        progress_callback=lambda event_type, text, data: progress_events.append((event_type, text, data)),
+    )
+
+    assert result.exit_code == 0
+    assert progress_events == [("sdk.stream_event", "Claude stream_event: message_start", {"message_type": "StreamEvent"})]
+
+
+def test_sdk_progress_text_summarizes_stream_events():
+    from gateway.claude_agent_sdk_bridge import _sdk_progress_text
+
+    StreamEvent = type("StreamEvent", (), {})
+    tool_event = StreamEvent()
+    tool_event.event = {
+        "type": "content_block_start",
+        "content_block": {"type": "tool_use", "name": "Read"},
+    }
+
+    text_delta = StreamEvent()
+    text_delta.event = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "secret content"}}
+
+    assert _sdk_progress_text(tool_event) == ("sdk.tool.started", "Claude tool 시작: Read")
+    assert _sdk_progress_text(text_delta) == ("sdk.text_delta", "Claude 응답 작성 중")

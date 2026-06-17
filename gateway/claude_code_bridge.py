@@ -99,6 +99,7 @@ class ClaudeCodeBridgeResult:
     log_dir: str
     exit_code: int
     raw_json: dict[str, Any] | None = None
+    interrupted: bool = False
 
 
 def is_claude_code_cli_config(config: dict[str, Any] | None) -> bool:
@@ -490,6 +491,9 @@ def build_claude_prompt(
     if normalized_role in {"lead", "clara-lead", "orchestrator", "coder"}:
         role_lines = [
             "You are Clara/클라라, Sangkun Lee's lead orchestrator and coding manager.",
+            "Clara is the coding orchestrator, not a review-only role.",
+            "For simple explanation, diagnosis, or decision-support questions, answer directly and avoid broad repository/tool exploration unless needed.",
+            "For implementation/debugging tasks, inspect, edit, run, verify, and report end-to-end.",
             "Operating mode: 2번 clara-lead. In this mode you take Hugo's normal lead role: receive the request, plan, execute, code, verify, coordinate helpers, and report the result.",
             "Use the official Claude Code CLI subscription runtime as your execution environment. Hugo becomes the reviewer/tester only when a separate review pass is useful, not an extra permission gate the user must manage.",
             "Opinion synthesis rule: in clara-lead mode you alone collect, weigh, and synthesize all helper opinions (Hugo review notes, Codex output, agent results) into one consolidated Clara report. Helpers never report to the user separately, and you never forward raw helper opinions without your own synthesized conclusion.",
@@ -640,6 +644,7 @@ def _run_claude_subprocess(
     timeout: int,
     job_id: str,
     progress_interval: int,
+    cancel_event: Any | None = None,
 ) -> tuple[str, str, int]:
     """Run Claude Code while emitting heartbeat progress from the parent.
 
@@ -659,6 +664,15 @@ def _run_claude_subprocess(
         stderr=subprocess.PIPE,
     )
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            proc.terminate()
+            try:
+                stdout, stderr = proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            stderr = (stderr or "") + "\nClaude Code CLI interrupted by user."
+            return stdout or "", stderr, 130
         now = time.time()
         remaining = timeout - (now - started)
         if remaining <= 0:
@@ -794,6 +808,8 @@ def run_claude_code_bridge_sync(
     history: Iterable[dict[str, Any]] | None,
     hermes_home: Path,
     bridge_session_key: str | None = None,
+    cancel_event: Any | None = None,
+    progress_callback: Any | None = None,
 ) -> ClaudeCodeBridgeResult:
     """Run a gateway turn via local Claude Code CLI and return a Hermes result."""
     bcfg = bridge_config(config)
@@ -1028,6 +1044,196 @@ def _format_bridge_result_text(
     return result_text
 
 
+def _looks_like_simple_clara_request(message: str) -> bool:
+    """Heuristic fast path: direct answer, no Claude Code tools.
+
+    Clara-lead should behave like Hugo/Codex for simple explanation/decision
+    support.  Keep this conservative: anything mentioning code/files/systems or
+    action verbs stays agentic.
+    """
+    text = str(message or "").strip()
+    if not text or len(text) > 280:
+        return False
+    lowered = text.casefold()
+    agentic_terms = (
+        "수정", "구현", "디버", "테스트", "실행", "설치", "세팅", "설정", "파일", "폴더",
+        "레포", "repo", "repository", "git", "diff", "커밋", "빌드", "배포", "로그", "에러",
+        "api", "openapi", "ecount", "이카운트", "코드", "검증", "확인해", "찾아", "검색",
+        "분석해", "조사", "브라우저", "옵시디언", "저장", "작성", "패치", "apply", "run",
+        "test", "debug", "fix", "implement", "build", "install", "configure", "search", "read",
+    )
+    if any(term in lowered for term in agentic_terms):
+        return False
+    direct_terms = (
+        "한 문장", "간단", "답해", "설명", "왜", "뭐", "무엇", "어때", "의견", "판단",
+        "yes", "no", "explain", "answer", "opinion", "what", "why",
+    )
+    return any(term in lowered for term in direct_terms)
+
+
+def run_claude_agent_sdk_bridge(
+    *,
+    config: dict[str, Any] | None,
+    message: str,
+    context_prompt: str | None,
+    channel_prompt: str | None,
+    history: Iterable[dict[str, Any]] | None,
+    hermes_home: Path,
+    bridge_session_key: str | None = None,
+    progress_callback: Any | None = None,
+) -> ClaudeCodeBridgeResult:
+    """Run a Clara turn through the official Claude Agent SDK.
+
+    This is the preferred subscription-compatible fast path when available.  It
+    keeps the request on Claude Code / ``claude -p`` subscription semantics while
+    exposing structured streaming/tool events to Hermes for future UI progress.
+    Any failure is raised to the caller so it can fall back to the resident CLI
+    bridge without changing user-visible behaviour.
+    """
+    bcfg = bridge_config(config)
+    claude_bin = str(bcfg.get("command") or shutil.which("claude") or "claude")
+    timeout = int(bcfg.get("timeout_seconds") or bcfg.get("timeout") or 1800)
+    agent_cfg = config.get("agent") if isinstance(config, dict) else {}
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+    max_turns = int(bcfg.get("sdk_max_turns") or bcfg.get("max_turns") or agent_cfg.get("max_turns") or 20)
+    sdk_simple_fast = bool(bcfg.get("sdk_simple_fast", True)) and _looks_like_simple_clara_request(message)
+    if sdk_simple_fast:
+        max_turns = min(max_turns, int(bcfg.get("sdk_simple_max_turns") or 1))
+    configured_allowed_tools = bcfg.get("sdk_allowed_tools", bcfg.get("allowed_tools"))
+    history_limit = int(bcfg.get("history_limit") or 12)
+    model = str(bcfg.get("sdk_model") or bcfg.get("model") or "").strip()
+    effort = str(bcfg.get("sdk_effort") or bcfg.get("effort") or "").strip()
+    permission_mode = str(bcfg.get("permission_mode") or "bypassPermissions").strip()
+    role_mode = str(bcfg.get("role_mode") or bcfg.get("role") or "").strip()
+    if not role_mode:
+        try:
+            from gateway.orchestrator_modes import read_mode, MODE_CLARA_LEAD
+            role_mode = "clara-lead" if read_mode(hermes_home).get("mode") == MODE_CLARA_LEAD else "reviewer"
+        except Exception:
+            role_mode = "reviewer"
+    role_is_lead = role_mode.strip().casefold().replace("_", "-") in {"lead", "clara-lead", "orchestrator", "coder"}
+    if sdk_simple_fast:
+        allowed_tools = []
+    elif configured_allowed_tools:
+        allowed_tools = [part.strip() for part in str(configured_allowed_tools).split(",") if part.strip()]
+    elif role_is_lead:
+        # In lead mode use the SDK's Claude Code tool preset without an explicit
+        # auto-allow list; permission_mode=bypassPermissions supplies the local
+        # user-approved automation boundary.
+        allowed_tools = []
+    else:
+        allowed_tools = [part.strip() for part in _DEFAULT_ALLOWED_TOOLS.strip(",").split(",") if part.strip()]
+
+    workdir = resolve_workdir(config, message, hermes_home=hermes_home)
+    resume_disabled_env = str(os.environ.get(_ENV_DISABLE_RESUME, "")).strip().casefold() in {"1", "true", "yes", "on"}
+    resume_cfg = bcfg.get("resume_enabled")
+    resume_disabled_config = isinstance(resume_cfg, bool) and not resume_cfg
+    resume_enabled = not (resume_disabled_env or resume_disabled_config)
+    resume_session_id = _lookup_claude_session(
+        hermes_home=hermes_home,
+        bridge_session_key=bridge_session_key,
+        workdir=workdir,
+        enabled=resume_enabled,
+    )
+    continuity_context = build_continuity_context(
+        hermes_home=hermes_home,
+        message=message,
+        workdir=workdir,
+    )
+    job_id = f"clara-sdk-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    log_dir = hermes_home / "clara-jobs" / job_id
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt = build_claude_prompt(
+        message=message,
+        context_prompt=context_prompt,
+        channel_prompt=channel_prompt,
+        history=history,
+        history_limit=history_limit,
+        workdir=workdir,
+        role_mode=role_mode,
+        continuity_context=continuity_context,
+    )
+    (log_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    metadata = {
+        "job_id": job_id,
+        "workdir": workdir,
+        "created_at": time.time(),
+        "provider": "claude-agent-sdk",
+        "delivery": "agent-sdk",
+        "max_turns": max_turns,
+        "allowed_tools": allowed_tools or "default",
+        "timeout_seconds": timeout,
+        "role_mode": role_mode,
+        "bridge_session_key": _normalize_bridge_session_key(bridge_session_key),
+        "resume_session_id": resume_session_id,
+        "resume_enabled": resume_enabled,
+        "sdk_tools": "none" if sdk_simple_fast else str(bcfg.get("sdk_tools") or "claude_code"),
+        "sdk_setting_sources": bcfg.get("sdk_setting_sources", "none"),
+        "sdk_simple_fast": sdk_simple_fast,
+    }
+    (log_dir / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    from gateway.claude_agent_sdk_bridge import run_sdk_turn
+
+    parsed = run_sdk_turn(
+        prompt=prompt,
+        workdir=workdir,
+        claude_bin=claude_bin,
+        max_turns=max_turns,
+        timeout=timeout,
+        permission_mode=permission_mode,
+        model=model,
+        effort=effort,
+        allowed_tools=allowed_tools,
+        tools_mode="none" if sdk_simple_fast else str(bcfg.get("sdk_tools") or "claude_code"),
+        setting_sources=bcfg.get("sdk_setting_sources", "none"),
+        include_partial_messages=bool(bcfg.get("sdk_include_partial_messages", True)),
+        include_hook_events=bool(bcfg.get("sdk_include_hook_events", False)),
+        resume_session_id=resume_session_id,
+        log_dir=log_dir,
+        progress_callback=progress_callback,
+    )
+    (log_dir / "result.json").write_text(
+        json.dumps(parsed, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+    _remember_claude_session(
+        hermes_home=hermes_home,
+        bridge_session_key=bridge_session_key,
+        claude_session_id=parsed.get("session_id"),
+        workdir=workdir,
+        job_id=job_id,
+    )
+
+    is_error = bool(parsed.get("is_error")) or str(parsed.get("subtype") or "success") != "success"
+    exit_code = 1 if is_error else 0
+    result_text = _format_bridge_result_text(
+        parsed=parsed,
+        exit_code=exit_code,
+        job_id=job_id,
+        log_dir=log_dir,
+        max_turns=max_turns,
+        bcfg=bcfg,
+    )
+    _write_bridge_ledger(
+        hermes_home=hermes_home,
+        bridge_session_key=bridge_session_key,
+        result_text=result_text,
+        exit_code=exit_code,
+    )
+    return ClaudeCodeBridgeResult(
+        final_response=result_text,
+        job_id=job_id,
+        workdir=workdir,
+        log_dir=str(log_dir),
+        exit_code=exit_code,
+        raw_json=parsed,
+    )
+
+
 def run_claude_code_bridge_resident(
     *,
     config: dict[str, Any] | None,
@@ -1037,6 +1243,8 @@ def run_claude_code_bridge_resident(
     history: Iterable[dict[str, Any]] | None,
     hermes_home: Path,
     bridge_session_key: str | None = None,
+    cancel_event: Any | None = None,
+    progress_callback: Any | None = None,
 ) -> ClaudeCodeBridgeResult:
     """Run a gateway turn through a resident (warm) Claude Code CLI process.
 
@@ -1047,6 +1255,24 @@ def run_claude_code_bridge_resident(
     a single point of failure.
     """
     bcfg = bridge_config(config)
+    if bcfg.get("sdk_enabled"):
+        try:
+            return run_claude_agent_sdk_bridge(
+                config=config,
+                message=message,
+                context_prompt=context_prompt,
+                channel_prompt=channel_prompt,
+                history=history,
+                hermes_home=hermes_home,
+                bridge_session_key=bridge_session_key,
+                progress_callback=progress_callback,
+            )
+        except Exception:
+            # The SDK path is an optimization/alternate transport.  If the
+            # optional package, auth policy, or SDK protocol fails, preserve the
+            # pre-existing Clara behaviour by falling back to the resident CLI
+            # bridge below (or sync spawn if resident is disabled).
+            pass
     if not bcfg.get("resident_enabled"):
         return run_claude_code_bridge_sync(
             config=config,

@@ -13304,6 +13304,81 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if bridge_config(user_config).get("resident_enabled")
                     else run_claude_code_bridge_sync
                 )
+
+                _bridge_progress_adapter = self.adapters.get(source.platform)
+                _bridge_progress_msg_id = [None]
+                _bridge_progress_last_text = [""]
+                _bridge_progress_last_at = [0.0]
+                _bridge_progress_loop = asyncio.get_running_loop()
+                try:
+                    from gateway.config import Platform as _BridgePlatform
+                    _bridge_thread_id = source.thread_id or (event_message_id if source.platform == _BridgePlatform.SLACK else None)
+                except Exception:
+                    _bridge_thread_id = source.thread_id
+                try:
+                    _bridge_progress_metadata = (
+                        self._thread_metadata_for_source(source, event_message_id)
+                        if _bridge_thread_id == source.thread_id
+                        else ({"thread_id": _bridge_thread_id} if _bridge_thread_id else None)
+                    )
+                except Exception:
+                    _bridge_progress_metadata = ({"thread_id": _bridge_thread_id} if _bridge_thread_id else None)
+
+                async def _send_bridge_progress_line(text: str) -> None:
+                    adapter = _bridge_progress_adapter
+                    if adapter is None or not text:
+                        return
+                    content = f"🟪 Clara 진행: {text}"
+                    try:
+                        if _bridge_progress_msg_id[0]:
+                            edit_kwargs = {
+                                "chat_id": source.chat_id,
+                                "message_id": _bridge_progress_msg_id[0],
+                                "content": content,
+                            }
+                            try:
+                                _edit_params = inspect.signature(adapter.edit_message).parameters
+                                if (
+                                    "metadata" in _edit_params
+                                    or any(param.kind is inspect.Parameter.VAR_KEYWORD for param in _edit_params.values())
+                                ):
+                                    edit_kwargs["metadata"] = _bridge_progress_metadata
+                            except Exception:
+                                pass
+                            result = await adapter.edit_message(**edit_kwargs)
+                            if getattr(result, "success", False):
+                                return
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content=content,
+                            metadata=_bridge_progress_metadata,
+                        )
+                        if getattr(result, "success", False) and getattr(result, "message_id", None):
+                            _bridge_progress_msg_id[0] = result.message_id
+                    except Exception as progress_exc:
+                        logger.debug("Claude SDK progress delivery failed: %s", progress_exc)
+
+                def _bridge_progress_callback(event_type, text, data=None):
+                    if not _run_still_current() or not text:
+                        return
+                    try:
+                        now = time.monotonic()
+                        force = str(event_type) not in {"sdk.text_delta", "sdk.thinking"}
+                        if (
+                            not force
+                            and text == _bridge_progress_last_text[0]
+                            and now - _bridge_progress_last_at[0] < 2.0
+                        ):
+                            return
+                        _bridge_progress_last_text[0] = str(text)
+                        _bridge_progress_last_at[0] = now
+                        asyncio.run_coroutine_threadsafe(
+                            _send_bridge_progress_line(str(text)),
+                            _bridge_progress_loop,
+                        )
+                    except Exception as progress_exc:
+                        logger.debug("Claude SDK progress callback failed: %s", progress_exc)
+
                 bridge_result = await asyncio.to_thread(
                     _bridge_runner,
                     config=user_config,
@@ -13313,6 +13388,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     history=history,
                     hermes_home=_hermes_home,
                     bridge_session_key=f"gateway:{session_id}",
+                    progress_callback=_bridge_progress_callback,
                 )
                 return {
                     "final_response": bridge_result.final_response,

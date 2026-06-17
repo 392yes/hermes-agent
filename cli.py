@@ -10620,6 +10620,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             else run_claude_code_bridge_sync
                         )
 
+                        def _bridge_progress_callback(_event_type, text, _data=None):
+                            try:
+                                self._spinner_text = f"🟪 {text}"
+                                self._tool_start_time = 0.0
+                                # clara-lead (claude bridge) lightweight tool history:
+                                # mirror codex's stacked scrollback lines so hermes-claude
+                                # shows a persistent record of tool calls, not just a
+                                # transient spinner. Name+status only; path/args/duration
+                                # are intentionally deferred (option 2).
+                                # content_block_stop (completed) often omits the
+                                # tool name, so the bridge rarely emits a usable
+                                # "completed" event; key off "started" too — in
+                                # practice exactly one of the pair carries a name,
+                                # so this yields ~one line per tool call.
+                                if (
+                                    _event_type in {"sdk.tool.started", "sdk.tool.completed"}
+                                    and getattr(self, "tool_progress_mode", "off") in {"all", "new"}
+                                ):
+                                    _cprint(f"  ┊ 🔧 {text}")
+                                self._invalidate()
+                            except Exception:
+                                pass
+
                         bridge_result = _bridge_runner(
                             config=_bridge_config,
                             message=agent_message,
@@ -10628,6 +10651,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             history=self.conversation_history[:-1],  # Exclude the message we just added
                             hermes_home=get_hermes_home(),
                             bridge_session_key=f"cli:{self.session_id}",
+                            progress_callback=_bridge_progress_callback,
                         )
                         previous_history = list(self.conversation_history[:-1])
                         result = {
