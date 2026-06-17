@@ -42,3 +42,29 @@ def test_clara_status_model_keeps_non_opus_model_without_clara_prefix():
     mod = _load_cli_module()
 
     assert mod.HermesCLI._format_claude_code_status_model("claude-fable-5") == "fable-5"
+
+
+def test_clara_lead_display_runtime_uses_sdk_provider(monkeypatch):
+    mod = _load_cli_module()
+    cli = mod.HermesCLI.__new__(mod.HermesCLI)
+    cli.config = {"clara_cli": {"sdk_enabled": True, "model": "claude-opus-4-8"}}
+    cli.model = "gpt-5.5"
+    cli.provider = "openai-codex"
+    monkeypatch.setenv("HERMES_LEAD_MODE", "clara-lead")
+
+    labels = cli._get_display_runtime_labels()
+
+    assert labels == {"model": "opus-4.8", "provider": "claude-code-sdk"}
+
+
+def test_hugo_display_runtime_keeps_configured_provider(monkeypatch):
+    mod = _load_cli_module()
+    cli = mod.HermesCLI.__new__(mod.HermesCLI)
+    cli.config = {"clara_cli": {"sdk_enabled": True, "model": "claude-opus-4-8"}}
+    cli.model = "gpt-5.5"
+    cli.provider = "openai-codex"
+    monkeypatch.setenv("HERMES_LEAD_MODE", "hugo-lead")
+
+    labels = cli._get_display_runtime_labels()
+
+    assert labels == {"model": "gpt-5.5", "provider": "openai-codex"}

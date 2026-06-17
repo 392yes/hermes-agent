@@ -4135,6 +4135,63 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         return model_short
 
+    def _get_claude_code_runtime_display(self) -> Dict[str, str]:
+        """Display-only model/provider labels for Clara/Claude Code lead mode.
+
+        Clara lead routes through the Claude Code bridge, so the configured
+        Hermes model/provider (often openai-codex + gpt-5.x for Hugo) is not the
+        runtime the user is talking to.  Keep routing untouched, but make banner
+        and status displays describe the active bridge transport instead.
+        """
+        bridge_cfg = (
+            (getattr(self, "config", {}) or {}).get("claude_code_cli")
+            or (getattr(self, "config", {}) or {}).get("clara_cli")
+            or {}
+        )
+        claude_model = ""
+        sdk_enabled = False
+        if isinstance(bridge_cfg, dict):
+            claude_model = str(bridge_cfg.get("model") or "").strip()
+            sdk_enabled = bool(bridge_cfg.get("sdk_enabled"))
+        if not claude_model:
+            try:
+                settings_path = Path.home() / ".claude" / "settings.json"
+                if settings_path.exists():
+                    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                    if isinstance(settings, dict):
+                        claude_model = str(settings.get("model") or "").strip()
+            except Exception:
+                claude_model = ""
+
+        if claude_model:
+            model_label = self._format_claude_code_status_model(claude_model)
+        else:
+            model_label = "Claude Code SDK" if sdk_enabled else "Claude Code"
+        if len(model_label) > 30:
+            model_label = f"{model_label[:27]}..."
+        return {
+            "model": model_label,
+            "provider": "claude-code-sdk" if sdk_enabled else "claude-code-cli",
+        }
+
+    def _get_active_lead_mode(self) -> str:
+        try:
+            from gateway.orchestrator_modes import read_mode
+
+            return os.environ.get("HERMES_LEAD_MODE") or read_mode(get_hermes_home()).get("mode") or ""
+        except Exception:
+            return os.environ.get("HERMES_LEAD_MODE") or ""
+
+    def _get_display_runtime_labels(self) -> Dict[str, str]:
+        try:
+            from gateway.orchestrator_modes import MODE_CLARA_LEAD
+
+            if self._get_active_lead_mode() == MODE_CLARA_LEAD:
+                return self._get_claude_code_runtime_display()
+        except Exception:
+            pass
+        return {"model": self.model or "unknown", "provider": self.provider or "unknown"}
+
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
         # self.model reflects the originally configured model and never
@@ -4153,31 +4210,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         agent_usage_label = ""
         agent_usage_reset_at = ""
         try:
-            from gateway.orchestrator_modes import MODE_CLARA_LEAD, MODE_HUGO_LEAD, read_mode
+            from gateway.orchestrator_modes import MODE_CLARA_LEAD, MODE_HUGO_LEAD
 
-            lead_mode_env = os.environ.get("HERMES_LEAD_MODE")
-            lead_mode = lead_mode_env or read_mode(get_hermes_home()).get("mode")
+            lead_mode = self._get_active_lead_mode()
             if lead_mode == MODE_CLARA_LEAD:
-                claude_model = ""
-                bridge_cfg = (getattr(self, "config", {}) or {}).get("claude_code_cli") or (getattr(self, "config", {}) or {}).get("clara_cli") or {}
-                if isinstance(bridge_cfg, dict):
-                    claude_model = str(bridge_cfg.get("model") or "").strip()
-                if not claude_model:
-                    settings_path = Path.home() / ".claude" / "settings.json"
-                    if settings_path.exists():
-                        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-                        if isinstance(settings, dict):
-                            claude_model = str(settings.get("model") or "").strip()
-                if claude_model:
-                    claude_model_short = self._format_claude_code_status_model(claude_model)
-                    # Keep Clara lead compact enough that the status-bar
-                    # renderer can preserve the strong/accent color instead
-                    # of falling back to a monochrome trimmed string in narrow
-                    # Wave panes.  Use the Claude Code model label without the
-                    # role prefix so `claude-opus-4-8` renders as `opus-4.8`.
-                    display_model_short = claude_model_short
-                else:
-                    display_model_short = "Claude Code"
+                display_model_short = self._get_claude_code_runtime_display()["model"]
                 usage = _get_agent_daily_usage_status_cached("claude-code")
                 agent_usage_percent = usage.get("percent")
                 agent_usage_label = str(usage.get("label") or "")
@@ -5509,7 +5546,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # Build and display the banner
             build_welcome_banner(
                 console=self.console,
-                model=self.model,
+                model=self._get_display_runtime_labels().get("model", self.model),
                 cwd=cwd,
                 tools=tools,
                 enabled_toolsets=self.enabled_toolsets,
@@ -5825,8 +5862,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             tool_count = len(tools) if tools else 0
             tool_status = f"{tool_count} tools"
 
-        # Format model name (shorten if needed)
-        model_short = self.model.split("/")[-1] if "/" in self.model else self.model
+        # Format display runtime label.  In clara-lead the actual turn is routed
+        # through Claude Code/SDK, so don't show the default Hugo/Codex model.
+        runtime_display = self._get_display_runtime_labels()
+        display_model = runtime_display.get("model") or self.model or "unknown"
+        display_provider = runtime_display.get("provider") or self.provider or "unknown"
+        model_short = display_model.split("/")[-1] if "/" in display_model else display_model
         if len(model_short) > 30:
             model_short = model_short[:27] + "..."
 
@@ -5849,7 +5890,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if self.enabled_toolsets and "all" not in self.enabled_toolsets:
             toolsets_info = f" [dim {separator_color}]·[/] [{label_color}]toolsets: {', '.join(self.enabled_toolsets)}[/]"
 
-        provider_info = f" [dim {separator_color}]·[/] [dim]provider: {self.provider}[/]"
+        provider_info = f" [dim {separator_color}]·[/] [dim]provider: {display_provider}[/]"
         if self._provider_source:
             provider_info += f" [dim {separator_color}]·[/] [dim]auth: {self._provider_source}[/]"
 
@@ -7667,7 +7708,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ctx_len = self.agent.context_compressor.context_length
                     build_welcome_banner(
                         console=cc,
-                        model=self.model,
+                        model=self._get_display_runtime_labels().get("model", self.model),
                         cwd=cwd,
                         tools=tools,
                         enabled_toolsets=self.enabled_toolsets,
