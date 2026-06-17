@@ -10620,25 +10620,58 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             else run_claude_code_bridge_sync
                         )
 
-                        def _bridge_progress_callback(_event_type, text, _data=None):
+                        def _bridge_progress_callback(_event_type, text="", _data=None):
                             try:
-                                self._spinner_text = f"🟪 {text}"
+                                data = _data if isinstance(_data, dict) else {}
+                                if _event_type == "clara.assistant.delta":
+                                    if text:
+                                        self._stream_delta(str(text))
+                                    self._invalidate()
+                                    return
+                                if _event_type == "clara.assistant.boundary":
+                                    # Match native Hermes/Codex tool loops: close
+                                    # any live response/status box before the tool
+                                    # line so progress notes and tool history appear
+                                    # as separate readable scrollback sections.
+                                    self._stream_delta(None)
+                                    self._invalidate()
+                                    return
+                                if _event_type == "clara.tool.started":
+                                    self._stream_delta(None)
+                                    hermes_tool = data.get("hermes_tool")
+                                    if hermes_tool:
+                                        self._on_tool_progress(
+                                            "tool.started",
+                                            hermes_tool,
+                                            data.get("preview") or hermes_tool,
+                                            data.get("tool_args") or {},
+                                        )
+                                    return
+                                if _event_type == "clara.tool.completed":
+                                    hermes_tool = data.get("hermes_tool")
+                                    if hermes_tool:
+                                        self._on_tool_progress(
+                                            "tool.completed",
+                                            hermes_tool,
+                                            None,
+                                            None,
+                                            duration=float(data.get("duration") or 0.0),
+                                            is_error=bool(data.get("is_error")),
+                                        )
+                                    return
+                                if _event_type in {"sdk.tool.started", "sdk.tool.completed"}:
+                                    # Raw Claude SDK names ("Claude tool 시작: Bash")
+                                    # are deliberately hidden in CLI scrollback. The
+                                    # structured clara.tool.* events above provide
+                                    # Codex/Hermes-style display instead.
+                                    return
+
+                                # Other human-readable SDK heartbeat events still
+                                # drive the live spinner without adding noisy
+                                # scrollback lines.
+                                if text:
+                                    self._spinner_text = f"🟪 {text}"
                                 self._tool_start_time = 0.0
-                                # clara-lead (claude bridge) lightweight tool history:
-                                # mirror codex's stacked scrollback lines so hermes-claude
-                                # shows a persistent record of tool calls, not just a
-                                # transient spinner. Name+status only; path/args/duration
-                                # are intentionally deferred (option 2).
-                                # content_block_stop (completed) often omits the
-                                # tool name, so the bridge rarely emits a usable
-                                # "completed" event; key off "started" too — in
-                                # practice exactly one of the pair carries a name,
-                                # so this yields ~one line per tool call.
-                                if (
-                                    _event_type in {"sdk.tool.started", "sdk.tool.completed"}
-                                    and getattr(self, "tool_progress_mode", "off") in {"all", "new"}
-                                ):
-                                    _cprint(f"  ┊ 🔧 {text}")
                                 self._invalidate()
                             except Exception:
                                 pass

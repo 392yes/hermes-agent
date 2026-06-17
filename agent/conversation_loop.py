@@ -484,6 +484,38 @@ def run_conversation(
                 if _bridge_config_for_claude(bridge_config).get("resident_enabled")
                 else run_claude_code_bridge_sync
             )
+            # Bridge tool-progress → CLI/TUI codex-style scrollback parity.
+            # The Claude Code bridge (SDK path) emits structured tool-lifecycle
+            # events (clara.tool.started/completed) carrying a Hermes-mapped tool
+            # name + args. Translate them into the agent's native tool-progress
+            # callback so the resident/SDK Clara turn renders the same
+            # `💻 $ / 📖 read / 🔧 patch / 🔎 grep` lines codex-lead already shows,
+            # instead of only the final response. Without this wiring the TUI saw
+            # nothing during a Clara turn.
+            _tpc = getattr(agent, "tool_progress_callback", None)
+
+            def _claude_bridge_progress(event_type, text="", data=None):
+                if not _tpc or not isinstance(data, dict):
+                    return
+                hermes_tool = data.get("hermes_tool")
+                if not hermes_tool:
+                    return
+                try:
+                    if event_type == "clara.tool.started":
+                        preview = str(data.get("preview") or "")[:120]
+                        _tpc("tool.started", hermes_tool, preview, data.get("tool_args") or {})
+                    elif event_type == "clara.tool.completed":
+                        _tpc(
+                            "tool.completed",
+                            hermes_tool,
+                            None,
+                            None,
+                            duration=float(data.get("duration") or 0.0),
+                            is_error=bool(data.get("is_error")),
+                        )
+                except Exception:
+                    pass
+
             bridge_result = _bridge_runner(
                 config=bridge_config,
                 message=user_message,
@@ -491,6 +523,7 @@ def run_conversation(
                 channel_prompt=None,
                 history=conversation_history or [],
                 hermes_home=Path(get_hermes_home()),
+                progress_callback=_claude_bridge_progress,
             )
             final_response = bridge_result.final_response
             return {

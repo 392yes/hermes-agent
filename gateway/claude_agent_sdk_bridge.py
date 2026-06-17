@@ -312,6 +312,7 @@ async def _run_sdk_turn_async(
     started = time.time()
     events: list[dict[str, Any]] = []
     latest_text = ""
+    streamed_text = ""
     result_event: dict[str, Any] | None = None
     session_id: str | None = None
     counts: dict[str, int] = {}
@@ -323,7 +324,7 @@ async def _run_sdk_turn_async(
     pending_tools: dict[str, tuple[str, float]] = {}
 
     async def _consume() -> None:
-        nonlocal latest_text, result_event, session_id
+        nonlocal latest_text, streamed_text, result_event, session_id
         nonlocal last_progress_text, last_progress_at
         async for message in query(prompt=prompt, options=options):
             elapsed = time.time() - started
@@ -347,11 +348,33 @@ async def _run_sdk_turn_async(
                 text = _message_to_text(message)
                 if text:
                     latest_text = text
+                    # Claude Agent SDK partial AssistantMessage values are often
+                    # cumulative snapshots rather than token deltas.  Convert
+                    # them to a best-effort delta so the Hermes CLI can reuse the
+                    # native streaming response box instead of waiting for the
+                    # final result panel.
+                    if text.startswith(streamed_text):
+                        delta = text[len(streamed_text):]
+                    else:
+                        delta = ("\n" if streamed_text else "") + text
+                    if delta:
+                        streamed_text = text
+                        _emit_progress(
+                            progress_callback,
+                            "clara.assistant.delta",
+                            delta,
+                            {"message_type": "AssistantMessage", "elapsed_seconds": round(elapsed, 3)},
+                        )
                 # Structured tool-start: ToolUseBlocks carry the complete input,
                 # so emit a codex-style "started" with normalized name + args.
                 for block in getattr(message, "content", []) or []:
                     if not _is_tool_use_block(block):
                         continue
+                    _emit_tool_event(
+                        progress_callback,
+                        "clara.assistant.boundary",
+                        {"message_type": "AssistantMessage", "elapsed_seconds": round(elapsed, 3)},
+                    )
                     tool_id = str(getattr(block, "id", "") or "")
                     sdk_tool = str(getattr(block, "name", "") or "")
                     tool_input = getattr(block, "input", {}) or {}

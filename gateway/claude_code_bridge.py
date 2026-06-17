@@ -547,7 +547,8 @@ def build_claude_prompt(
     else:
         parts.append(
             "\nReturn a Hermes CLI-ready Clara response in the same readable structure as the native Hermes/Codex runtime. "
-            "Start with one short topic/title line, then a compact core summary, then grouped bullet lists for details. "
+            "During long or tool-using work, write short Korean progress notes before each major tool batch so the CLI can show live boxed status sections, e.g. '변경 범위 확인', '테스트 실행', '결과 정리'. "
+            "Start the final answer with one short topic/title line, then a compact core summary, then grouped bullet lists for details. "
             "Include verification results and remaining actions only when relevant. Prefer bullets over long paragraphs. "
             "Do not include a Slack role marker such as '🟪 Clara/클라라 —' in CLI responses."
         )
@@ -974,6 +975,7 @@ def run_claude_code_bridge_sync(
             timeout=timeout,
             job_id=job_id,
             progress_interval=progress_interval,
+            cancel_event=cancel_event,
         )
     except subprocess.TimeoutExpired as exc:
         # Defensive fallback for tests/monkeypatches that still raise the old
@@ -1323,6 +1325,7 @@ def run_claude_code_bridge_resident(
             history=history,
             hermes_home=hermes_home,
             bridge_session_key=bridge_session_key,
+            cancel_event=cancel_event,
         )
 
     claude_bin = str(bcfg.get("command") or shutil.which("claude") or "claude")
@@ -1449,6 +1452,7 @@ def run_claude_code_bridge_resident(
                 first_prompt=first_prompt,
                 followup_text=message,
                 timeout=timeout,
+                cancel_event=cancel_event,
             )
             if _is_resident_startup_execution_error(parsed):
                 errors = parsed.get("errors") if isinstance(parsed.get("errors"), list) else []
@@ -1479,6 +1483,7 @@ def run_claude_code_bridge_resident(
             history=history,
             hermes_home=hermes_home,
             bridge_session_key=bridge_session_key,
+            cancel_event=cancel_event,
         )
 
     (log_dir / "result.json").write_text(

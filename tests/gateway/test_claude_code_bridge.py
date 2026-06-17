@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import sys
+import types
 from pathlib import Path
 
 from gateway.claude_code_bridge import (
@@ -68,6 +70,8 @@ def test_build_prompt_without_channel_uses_hermes_cli_response_format():
     )
     assert "Return a Hermes CLI-ready Clara response" in prompt
     assert "native Hermes/Codex runtime" in prompt
+    assert "short Korean progress notes before each major tool batch" in prompt
+    assert "live boxed status sections" in prompt
     assert "one short topic/title line" in prompt
     assert "compact core summary" in prompt
     assert "grouped bullet lists" in prompt
@@ -618,3 +622,87 @@ def test_sdk_progress_text_summarizes_stream_events():
 
     assert _sdk_progress_text(tool_event) == ("sdk.tool.started", "Claude tool 시작: Read")
     assert _sdk_progress_text(text_delta) == ("sdk.text_delta", "Claude 응답 작성 중")
+
+
+def test_sdk_turn_emits_clara_streaming_and_structured_tool_events(monkeypatch, tmp_path):
+    from gateway.claude_agent_sdk_bridge import run_sdk_turn
+
+    class ClaudeAgentOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class TextBlock:
+        def __init__(self, text):
+            self.text = text
+
+    class ToolUseBlock:
+        def __init__(self, tool_id, name, inp):
+            self.id = tool_id
+            self.name = name
+            self.input = inp
+
+    class ToolResultBlock:
+        def __init__(self, tool_id):
+            self.tool_use_id = tool_id
+            self.is_error = False
+
+    class AssistantMessage:
+        def __init__(self, content):
+            self.content = content
+            self.session_id = "sdk-session-1"
+
+    class UserMessage:
+        def __init__(self, content):
+            self.content = content
+
+    class ResultMessage:
+        subtype = "success"
+        is_error = False
+        duration_ms = 123
+        duration_api_ms = 100
+        num_turns = 2
+        total_cost_usd = 0
+        usage = {}
+        session_id = "sdk-session-1"
+
+    async def query(prompt, options):
+        yield AssistantMessage([
+            TextBlock("변경 범위 확인\n"),
+            ToolUseBlock("tool-1", "Bash", {"command": "git status --short"}),
+        ])
+        yield UserMessage([ToolResultBlock("tool-1")])
+        yield AssistantMessage([TextBlock("변경 범위 확인\n결과 정리\n")])
+        yield ResultMessage()
+
+    fake_sdk = types.SimpleNamespace(ClaudeAgentOptions=ClaudeAgentOptions, query=query)
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_sdk)
+    progress_events = []
+
+    result = run_sdk_turn(
+        prompt="prompt",
+        workdir=str(tmp_path),
+        claude_bin="claude",
+        max_turns=4,
+        timeout=5,
+        permission_mode="bypassPermissions",
+        log_dir=tmp_path,
+        progress_callback=lambda event_type, text, data: progress_events.append((event_type, text, data)),
+    )
+
+    assert result["result"] == "변경 범위 확인\n결과 정리"
+    event_types = [event[0] for event in progress_events]
+    assert "clara.assistant.delta" in event_types
+    assert "clara.assistant.boundary" in event_types
+    assert "clara.tool.started" in event_types
+    assert "clara.tool.completed" in event_types
+    assert ("clara.assistant.delta", "변경 범위 확인") == progress_events[1][:2]
+    assert any(
+        event_type == "clara.tool.started"
+        and data.get("hermes_tool") == "terminal"
+        and data.get("tool_args", {}).get("command") == "git status --short"
+        for event_type, _text, data in progress_events
+    )
+    assert any(
+        event_type == "clara.assistant.delta" and text == "\n결과 정리"
+        for event_type, text, _data in progress_events
+    )

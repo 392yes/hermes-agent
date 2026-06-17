@@ -40,6 +40,10 @@ class ResidentTurnError(RuntimeError):
     """Raised when a resident turn cannot complete (dead proc / timeout / proto)."""
 
 
+class ResidentTurnCancelled(ResidentTurnError):
+    """Raised when the caller interrupts the active resident Claude turn."""
+
+
 @dataclass
 class _ResidentProc:
     key: str
@@ -232,14 +236,20 @@ class ResidentClaudePool:
                 return
 
     @staticmethod
-    def _collect_until_result(entry: _ResidentProc, timeout: float) -> dict[str, Any]:
+    def _collect_until_result(
+        entry: _ResidentProc,
+        timeout: float,
+        cancel_event: Any | None = None,
+    ) -> dict[str, Any]:
         deadline = time.time() + max(1.0, timeout)
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ResidentTurnCancelled("resident turn interrupted")
             remaining = deadline - time.time()
             if remaining <= 0:
                 raise ResidentTurnError("resident turn timed out")
             try:
-                event = entry.events.get(timeout=min(1.0, remaining))
+                event = entry.events.get(timeout=min(0.2, remaining))
             except queue.Empty:
                 if not entry.alive():
                     raise ResidentTurnError("resident process exited mid-turn")
@@ -260,6 +270,7 @@ class ResidentClaudePool:
         first_prompt: str,
         followup_text: str,
         timeout: float,
+        cancel_event: Any | None = None,
     ) -> dict[str, Any]:
         """Drive one turn; return the parsed ``result`` event dict.
 
@@ -274,6 +285,8 @@ class ResidentClaudePool:
             env=env,
         )
         with entry.lock:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ResidentTurnCancelled("resident turn interrupted before send")
             if not entry.alive():
                 raise ResidentTurnError("resident process not alive")
             # Fresh process: send the full framing prompt so behaviour matches
@@ -281,7 +294,14 @@ class ResidentClaudePool:
             # memory, so only the new user message is sent.
             self._drain_nonblocking(entry)
             self._send(entry, first_prompt if is_new else followup_text)
-            result = self._collect_until_result(entry, timeout)
+            try:
+                result = self._collect_until_result(entry, timeout, cancel_event=cancel_event)
+            except ResidentTurnCancelled:
+                # A cancelled turn leaves Claude Code's stream-json protocol in
+                # an unknown state. Drop the process immediately so the next
+                # turn starts clean instead of reusing a half-finished request.
+                self._drop(key, entry)
+                raise
             entry.last_used = time.time()
             sid = str(result.get("session_id") or "").strip()
             if sid:

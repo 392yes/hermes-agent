@@ -11,6 +11,7 @@ import json
 import os
 import stat
 import textwrap
+import threading
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,33 @@ def test_bridge_resident_disabled_delegates_to_sync(monkeypatch, tmp_path):
     assert out.final_response == "SYNC"
 
 
+def test_bridge_resident_disabled_forwards_cancel_event_to_sync(monkeypatch, tmp_path):
+    sentinel = bridge.ClaudeCodeBridgeResult(
+        final_response="SYNC", job_id="j", workdir=".", log_dir=".", exit_code=0
+    )
+    cancel_event = threading.Event()
+    called = {}
+
+    def fake_sync(**kwargs):
+        called.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(bridge, "run_claude_code_bridge_sync", fake_sync)
+    out = bridge.run_claude_code_bridge_resident(
+        config={"clara_cli": {"enabled": True}},
+        message="hi",
+        context_prompt=None,
+        channel_prompt=None,
+        history=[],
+        hermes_home=tmp_path,
+        bridge_session_key="gateway:s1",
+        cancel_event=cancel_event,
+    )
+
+    assert out.final_response == "SYNC"
+    assert called["cancel_event"] is cancel_event
+
+
 def test_bridge_resident_falls_back_to_sync_on_pool_failure(monkeypatch, tmp_path):
     sentinel = bridge.ClaudeCodeBridgeResult(
         final_response="SYNC-FALLBACK", job_id="j", workdir=".", log_dir=".", exit_code=0
@@ -242,6 +270,42 @@ def test_bridge_resident_retries_zero_turn_execution_error_without_resume(monkey
     assert any("invalidated" in c for c in calls)
     assert out.exit_code == 0
     assert "복구 완료" in out.final_response
+
+
+def test_bridge_resident_forwards_cancel_event_to_pool(monkeypatch, tmp_path):
+    cancel_event = threading.Event()
+    calls = []
+
+    class _OkPool:
+        def run_turn(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "작업 완료",
+                "session_id": "sess-xyz",
+            }
+
+        def invalidate(self, key):
+            pass
+
+    import gateway.claude_resident as resident
+    monkeypatch.setattr(resident, "get_pool", lambda **k: _OkPool())
+
+    out = bridge.run_claude_code_bridge_resident(
+        config={"clara_cli": {"enabled": True, "resident_enabled": True, "command": "claude"}},
+        message="작업해줘",
+        context_prompt=None,
+        channel_prompt=None,
+        history=[],
+        hermes_home=tmp_path,
+        bridge_session_key="gateway:s1",
+        cancel_event=cancel_event,
+    )
+
+    assert out.exit_code == 0
+    assert calls and calls[0]["cancel_event"] is cancel_event
 
 
 def test_bridge_resident_success_formats_slack_text(monkeypatch, tmp_path):
