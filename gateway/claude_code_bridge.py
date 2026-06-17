@@ -540,9 +540,17 @@ def build_claude_prompt(
         # of an empty request or a raw content-parts list repr.
         request_text = "(사용자가 텍스트 없이 이미지/첨부만 보냈습니다.)"
     parts.append("\nCurrent user request:\n" + request_text)
-    parts.append(
-        "\nReturn a Slack-ready Clara response. Include what you checked, findings, and next action."
-    )
+    if channel_prompt:
+        parts.append(
+            "\nReturn a Slack-ready Clara response. Include what you checked, findings, and next action."
+        )
+    else:
+        parts.append(
+            "\nReturn a Hermes CLI-ready Clara response in the same readable structure as the native Hermes/Codex runtime. "
+            "Start with one short topic/title line, then a compact core summary, then grouped bullet lists for details. "
+            "Include verification results and remaining actions only when relevant. Prefer bullets over long paragraphs. "
+            "Do not include a Slack role marker such as '🟪 Clara/클라라 —' in CLI responses."
+        )
     return "\n\n".join(parts)
 
 
@@ -564,6 +572,43 @@ def _json_from_mixed_stdout(stdout: str) -> dict[str, Any] | None:
                 except json.JSONDecodeError:
                     continue
     return None
+
+
+def _is_cli_bridge_output(channel_prompt: str | None, bridge_session_key: str | None) -> bool:
+    """Return True for local CLI/Wave Clara bridge turns.
+
+    Gateway/Slack turns may occasionally omit a channel prompt in tests or
+    fallbacks, so the stable discriminator for the local terminal path is the
+    bridge session key prefix used by cli.py (`cli:<session_id>`).
+    """
+    if channel_prompt:
+        return False
+    key = _normalize_bridge_session_key(bridge_session_key) or ""
+    return key.startswith("cli:")
+
+
+def _apply_response_prefix(
+    result_text: str,
+    bcfg: dict[str, Any],
+    *,
+    include_prefix: bool,
+) -> str:
+    """Normalize Clara role markers for Slack vs CLI output.
+
+    Slack keeps the visible Clara marker. CLI/Wave uses the Hermes panel title
+    as the visual speaker label, so it strips any model-emitted Slack marker
+    instead of prepending one inside the response body.
+    """
+    prefix = str(bcfg.get("response_prefix") or "🟪 Clara/클라라 — ")
+    if not prefix:
+        return result_text
+    marker = prefix.strip()
+    body = result_text.lstrip()
+    while marker and body.startswith(marker):
+        body = body[len(marker):].lstrip()
+    if include_prefix:
+        return prefix + body
+    return body
 
 
 def _format_compact_tokens(count: int) -> str:
@@ -969,15 +1014,11 @@ def run_claude_code_bridge_sync(
             max_turns=max_turns,
         )
 
-    prefix = str(bcfg.get("response_prefix") or "🟪 Clara/클라라 — ")
-    if prefix:
-        # The model may emit the marker itself with trailing newline/space
-        # variants; strip every leading occurrence, then prepend exactly one.
-        marker = prefix.strip()
-        body = result_text.lstrip()
-        while marker and body.startswith(marker):
-            body = body[len(marker):].lstrip()
-        result_text = prefix + body
+    result_text = _apply_response_prefix(
+        result_text,
+        bcfg,
+        include_prefix=not _is_cli_bridge_output(channel_prompt, bridge_session_key),
+    )
     if bool(bcfg.get("show_job_footer", False)):
         result_text += f"\n\n_Claude Code CLI job: {job_id}_"
     if bool(bcfg.get("show_token_usage_footer", False)):
@@ -1010,10 +1051,11 @@ def _format_bridge_result_text(
     log_dir: Path,
     max_turns: int,
     bcfg: dict[str, Any],
+    include_prefix: bool = True,
     stderr: str = "",
     stdout: str = "",
 ) -> str:
-    """Shared success/failure -> Slack text rendering for both bridge paths."""
+    """Shared success/failure -> user-facing text rendering for bridge paths."""
     if exit_code == 0 and parsed and not parsed.get("is_error"):
         result_text = str(parsed.get("result") or "").strip()
         if not result_text:
@@ -1028,13 +1070,11 @@ def _format_bridge_result_text(
             log_dir=log_dir,
             max_turns=max_turns,
         )
-    prefix = str(bcfg.get("response_prefix") or "🟪 Clara/클라라 — ")
-    if prefix:
-        marker = prefix.strip()
-        body = result_text.lstrip()
-        while marker and body.startswith(marker):
-            body = body[len(marker):].lstrip()
-        result_text = prefix + body
+    result_text = _apply_response_prefix(
+        result_text,
+        bcfg,
+        include_prefix=include_prefix,
+    )
     if bool(bcfg.get("show_job_footer", False)):
         result_text += f"\n\n_Claude Code CLI job: {job_id}_"
     if bool(bcfg.get("show_token_usage_footer", False)):
@@ -1217,6 +1257,7 @@ def run_claude_agent_sdk_bridge(
         log_dir=log_dir,
         max_turns=max_turns,
         bcfg=bcfg,
+        include_prefix=not _is_cli_bridge_output(channel_prompt, bridge_session_key),
     )
     _write_bridge_ledger(
         hermes_home=hermes_home,
@@ -1460,6 +1501,7 @@ def run_claude_code_bridge_resident(
         log_dir=log_dir,
         max_turns=max_turns,
         bcfg=bcfg,
+        include_prefix=not _is_cli_bridge_output(channel_prompt, bridge_session_key),
     )
 
     _write_bridge_ledger(

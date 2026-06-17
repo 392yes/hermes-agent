@@ -54,6 +54,40 @@ def test_build_prompt_includes_write_authority_boundary():
     assert "continuity packet" in prompt
     assert "테스트 실패 로그 분석해줘" in prompt
     assert "/tmp/project" in prompt
+    assert "Return a Slack-ready Clara response" in prompt
+
+
+def test_build_prompt_without_channel_uses_hermes_cli_response_format():
+    prompt = build_claude_prompt(
+        message="보기 쉽게 요약해줘",
+        context_prompt="ctx",
+        channel_prompt=None,
+        history=[],
+        workdir="/tmp/project",
+        role_mode="clara-lead",
+    )
+    assert "Return a Hermes CLI-ready Clara response" in prompt
+    assert "native Hermes/Codex runtime" in prompt
+    assert "one short topic/title line" in prompt
+    assert "compact core summary" in prompt
+    assert "grouped bullet lists" in prompt
+    assert "verification results and remaining actions" in prompt
+    assert "Do not include a Slack role marker" in prompt
+    assert "Return a Slack-ready Clara response" not in prompt
+
+
+def test_build_prompt_with_channel_keeps_slack_response_format():
+    prompt = build_claude_prompt(
+        message="보고해줘",
+        context_prompt="ctx",
+        channel_prompt="channel",
+        history=[],
+        workdir="/tmp/project",
+        role_mode="clara-lead",
+    )
+    assert "Return a Slack-ready Clara response" in prompt
+    assert "🟪 Clara/클라라 —" in prompt
+    assert "Return a Hermes CLI-ready Clara response" not in prompt
 
 
 def test_build_prompt_in_clara_lead_overrides_hugo_channel_marker():
@@ -177,9 +211,9 @@ def test_run_bridge_removes_anthropic_api_key_and_parses_noisy_json(tmp_path, mo
     assert json.loads(Path(result.log_dir, "result.json").read_text())["result"] == "OK"
 
 
-def test_run_bridge_does_not_duplicate_role_marker(tmp_path):
-    # The model often emits the marker itself followed by a newline instead of
-    # a trailing space; the bridge must still prepend exactly one marker.
+def test_run_bridge_strips_role_marker_for_cli_output(tmp_path):
+    # In CLI/Wave the Hermes panel title is the speaker label, so any model-emitted
+    # Slack marker should be stripped from the response body.
     model_output = "🟪 Clara/클라라 —\n\n**결론: 준비 완료**"
     fake = tmp_path / "claude"
     fake.write_text(
@@ -204,6 +238,40 @@ def test_run_bridge_does_not_duplicate_role_marker(tmp_path):
         message="ping",
         context_prompt=None,
         channel_prompt=None,
+        history=[],
+        hermes_home=tmp_path / "hermes",
+        bridge_session_key="cli:test-pane",
+    )
+    assert result.exit_code == 0
+    assert "🟪 Clara/클라라 —" not in result.final_response
+    assert result.final_response.startswith("**결론: 준비 완료**")
+
+
+def test_run_bridge_keeps_single_role_marker_for_slack_output(tmp_path):
+    model_output = "🟪 Clara/클라라 —\n\n**결론: 준비 완료**"
+    fake = tmp_path / "claude"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        f"print(json.dumps({{'type':'result','subtype':'success','is_error':False,'result':{model_output!r}}}))\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    result = run_claude_code_bridge_sync(
+        config={
+            "clara_cli": {
+                "command": str(fake),
+                "workdir": str(workdir),
+                "allowed_tools": "Read",
+                "max_turns": 1,
+                "timeout_seconds": 10,
+            }
+        },
+        message="ping",
+        context_prompt=None,
+        channel_prompt="Slack channel instruction",
         history=[],
         hermes_home=tmp_path / "hermes",
     )
