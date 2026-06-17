@@ -227,6 +227,12 @@ def _pinned_switch_notice() -> str | None:
 
 
 def handle_mode_text(text: str, *, hermes_home: Path | None = None, source: str = "gateway") -> str | None:
+    # Lead-mode switching/status is retired for pinned panes: panes are now
+    # distinguished solely by the hermes-claude / hermes-codex launchers, so a
+    # bare "1"/"2"/"현재 모드" passes through as normal agent input instead of
+    # surfacing a control-plane banner. Non-pinned `hermes` keeps full behavior.
+    if env_pinned_mode():
+        return None
     parsed = parse_mode_request(text)
     if parsed is None:
         return None

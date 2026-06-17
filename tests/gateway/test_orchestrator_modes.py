@@ -56,7 +56,9 @@ def test_env_pin_blocks_mode_switch_and_keeps_global_file(tmp_path: Path, monkey
     write_mode("clara-lead", hermes_home=tmp_path, source="test")
     monkeypatch.setenv("HERMES_LEAD_MODE", "hugo-lead")
     reply = handle_mode_text("1번", hermes_home=tmp_path, source="test")
-    assert reply is not None and "고정" in reply
+    # Pinned panes now stay silent (return None) instead of emitting a notice
+    # banner, so a bare menu-number reply isn't hijacked into a mode switch.
+    assert reply is None
     monkeypatch.delenv("HERMES_LEAD_MODE")
     assert read_mode(tmp_path)["mode"] == MODE_CLARA_LEAD
 
