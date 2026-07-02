@@ -133,6 +133,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
+    CommandDef("model-swap", "Swap the Clara bridge model mid-session (opus/fable)",
+               "Configuration", cli_only=True, aliases=("mswap",),
+               args_hint="[opus|fable|<model>|off|status]",
+               subcommands=("opus", "fable", "off", "status")),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
     CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose",
