@@ -37,14 +37,19 @@ import tempfile
 import time
 import uuid
 import textwrap
+import threading
+import shlex
 from collections import deque
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+_AGENT_DAILY_USAGE_STATUS_CACHE: Dict[str, Dict[str, Any]] = {}
+_AGENT_DAILY_USAGE_STATUS_LOCK = threading.Lock()
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -77,17 +82,18 @@ except (ImportError, AttributeError):
 
 try:
     from hermes_cli.pt_input_extras import (
+        install_arrow_key_aliases,
         install_ctrl_enter_alias,
         install_ignored_terminal_sequences,
         install_shift_enter_alias,
     )
     install_shift_enter_alias()
     install_ctrl_enter_alias()
+    install_arrow_key_aliases()
     install_ignored_terminal_sequences()
-    del install_shift_enter_alias, install_ctrl_enter_alias, install_ignored_terminal_sequences
+    del install_shift_enter_alias, install_ctrl_enter_alias, install_arrow_key_aliases, install_ignored_terminal_sequences
 except Exception:
     pass
-import threading
 import queue
 
 def CanonicalUsage(*args, **kwargs):
@@ -139,6 +145,131 @@ def format_token_count_compact(*args, **kwargs):
             return f"{sign}{text}{suffix}"
 
     return f"{value:,}"
+
+
+def _token_tracker_python_path() -> Optional[str]:
+    """Return the token-tracker tool Python, if installed via uv tool."""
+    candidates = [
+        Path.home() / ".local" / "share" / "uv" / "tools" / "token-tracker" / "bin" / "python",
+        Path.home() / ".local" / "share" / "uv" / "tools" / "token-tracker" / "Scripts" / "python.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _format_agent_daily_usage_from_token_tracker(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize token-tracker daily P90 usage for the Hermes status bar."""
+    agent_id = str(payload.get("agent_id") or "")
+    pct = payload.get("pct")
+    if pct is None:
+        return {}
+    try:
+        pct_int = max(0, min(999, round(float(pct))))
+    except Exception:
+        return {}
+    label = "Codex" if agent_id == "codex" else "CC"
+    reset_at = payload.get("reset_at")
+    reset_at = str(reset_at) if reset_at else ""
+    return {"agent_id": agent_id, "label": label, "percent": pct_int, "reset_at": reset_at}
+
+
+def _refresh_agent_daily_usage_status(agent_id: str) -> None:
+    """Background refresh for token-tracker daily usage labels.
+
+    The status bar repaints often; never block it on token-tracker log scans.
+    """
+    import subprocess
+
+    usage: dict[str, Any] = {}
+    try:
+        python = _token_tracker_python_path()
+        if not python:
+            raise RuntimeError("token-tracker uv tool Python not found")
+        code = r'''
+import json, sys
+from datetime import UTC, datetime, timedelta
+from src.adapters import claude, codex
+from src.analyzer.aggregator import aggregate_daily
+from src.analyzer.blocks import analyze_blocks, calculate_p90
+
+agent_id = sys.argv[1]
+loader = claude if agent_id == "claude-code" else codex if agent_id == "codex" else None
+if loader is None:
+    print(json.dumps({"agent_id": agent_id, "pct": None}))
+    raise SystemExit(0)
+entries = loader.load_entries()
+daily = aggregate_daily(entries)
+now = datetime.now(UTC)
+today_key = now.date().isoformat()
+today = next((d for d in daily if d.date == today_key), None)
+p90 = calculate_p90(daily)
+limit = int(getattr(p90, "token_limit", 0) or 0)
+used = int(getattr(today, "total_tokens", 0) or 0) if today else 0
+pct = (used / limit * 100) if limit > 0 else None
+# The percentage is a UTC calendar-day total, so always provide the next
+# daily rollover.  If token-tracker also has an active rolling block, that
+# is more precise for active rate-limit recovery and remains preferred.
+daily_reset_at = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).isoformat()
+reset_at = daily_reset_at
+try:
+    blocks = analyze_blocks(entries)
+    active = next(
+        (b for b in reversed(blocks)
+         if getattr(b, "is_active", False) and not getattr(b, "is_gap", False)),
+        None,
+    )
+    if active is not None and getattr(active, "end_time", None) is not None:
+        reset_at = active.end_time.isoformat()
+except Exception:
+    reset_at = daily_reset_at
+print(json.dumps({"agent_id": agent_id, "pct": pct, "used": used, "limit": limit, "reset_at": reset_at}))
+'''
+        completed = subprocess.run(
+            [python, "-c", code, agent_id],
+            text=True,
+            capture_output=True,
+            timeout=8,
+        )
+        if completed.returncode == 0 and completed.stdout.strip():
+            usage = _format_agent_daily_usage_from_token_tracker(json.loads(completed.stdout))
+    except Exception:
+        usage = {}
+    try:
+        with _AGENT_DAILY_USAGE_STATUS_LOCK:
+            state = _AGENT_DAILY_USAGE_STATUS_CACHE.setdefault(agent_id, {})
+            state["usage"] = usage
+            state["checked_at"] = time.time()
+            state["updating"] = False
+    except Exception:
+        pass
+
+
+def _get_agent_daily_usage_status_cached(agent_id: str) -> dict[str, Any]:
+    """Return cached token-tracker daily usage and refresh asynchronously."""
+    if agent_id not in {"claude-code", "codex"}:
+        return {}
+    try:
+        now = time.time()
+        with _AGENT_DAILY_USAGE_STATUS_LOCK:
+            state = _AGENT_DAILY_USAGE_STATUS_CACHE.setdefault(
+                agent_id, {"usage": {}, "checked_at": 0.0, "updating": False}
+            )
+            usage = dict(state.get("usage") or {})
+            checked_at = float(state.get("checked_at") or 0.0)
+            updating = bool(state.get("updating"))
+            if now - checked_at > 60 and not updating:
+                state["updating"] = True
+                threading.Thread(
+                    target=_refresh_agent_daily_usage_status,
+                    args=(agent_id,),
+                    daemon=True,
+                    name=f"{agent_id}-daily-usage-status-refresh",
+                ).start()
+            return usage
+    except Exception:
+        return {}
 
 
 def is_table_divider(*args, **kwargs):
@@ -394,7 +525,7 @@ def load_cli_config() -> Dict[str, Any]:
         "terminal": {
             "env_type": "local",
             "cwd": ".",  # "." is resolved to os.getcwd() at runtime
-            "home_mode": "auto",
+            "timeout": 60,
             "lifetime_seconds": 300,
             "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
             "docker_forward_env": [],
@@ -589,7 +720,6 @@ def load_cli_config() -> Dict[str, Any]:
         "env_type": "TERMINAL_ENV",
         "cwd": "TERMINAL_CWD",
         "timeout": "TERMINAL_TIMEOUT",
-        "home_mode": "TERMINAL_HOME_MODE",
         "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
         "docker_image": "TERMINAL_DOCKER_IMAGE",
         "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
@@ -978,11 +1108,6 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
     except Exception:
         pass
     try:
-        from tools.async_delegation import interrupt_all as _interrupt_async_delegations
-        _interrupt_async_delegations(reason="CLI shutdown")
-    except Exception:
-        pass
-    try:
         _cleanup_all_browsers()
     except Exception:
         pass
@@ -1340,17 +1465,6 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
         except Exception as e:
             logger.debug("Error copying .worktreeinclude entries: %s", e)
 
-    # Lock the worktree so other processes (and `git worktree remove`) can see
-    # it is actively in use.  Fail-soft: a lock failure never blocks the session.
-    try:
-        subprocess.run(
-            ["git", "worktree", "lock", "--reason", f"hermes pid={os.getpid()}", str(wt_path)],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
-        )
-        logger.debug("Worktree locked: %s (pid=%s)", wt_path, os.getpid())
-    except Exception as e:
-        logger.debug("git worktree lock failed (non-fatal): %s", e)
-
     info = {
         "path": str(wt_path),
         "branch": branch_name,
@@ -1426,16 +1540,6 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
 
     # Remove worktree (even if working tree is dirty — uncommitted
     # changes without unpushed commits are just artifacts)
-    # Unlock first so `git worktree remove` isn't blocked by the lock we
-    # placed at creation time.  Fail-soft — never block cleanup.
-    try:
-        subprocess.run(
-            ["git", "worktree", "unlock", wt_path],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
-        )
-    except Exception as e:
-        logger.debug("git worktree unlock failed (non-fatal): %s", e)
-
     try:
         subprocess.run(
             ["git", "worktree", "remove", wt_path, "--force"],
@@ -2003,24 +2107,6 @@ _ACCENT = _SkinAwareAnsi("response_border", "#FFD700", bold=True)
 # Terminal.app modes.  Hardcoded skin colors like #B8860B
 # (dark goldenrod) become invisible against light cream backgrounds.
 _DIM = "\x1b[2;3m"
-
-
-def _b(s: str) -> str:
-    """Bold if stdout is a real TTY; plain text otherwise (slash-worker safe)."""
-    import sys as _sys
-    try:
-        return f"\x1b[1m{s}\x1b[0m" if _sys.stdout.isatty() else str(s)
-    except Exception:
-        return str(s)
-
-
-def _d(s: str) -> str:
-    """Dim-italic if stdout is a real TTY; plain text otherwise."""
-    import sys as _sys
-    try:
-        return f"\x1b[2;3m{s}\x1b[0m" if _sys.stdout.isatty() else str(s)
-    except Exception:
-        return str(s)
 
 
 def _accent_hex() -> str:
@@ -2615,8 +2701,18 @@ def _format_image_attachment_badges(attached_images: list[Path], image_counter: 
 
 
 def _should_auto_attach_clipboard_image_on_paste(pasted_text: str) -> bool:
-    """Auto-attach clipboard images only for image-only paste gestures."""
-    return not pasted_text.strip()
+    """Return whether an empty terminal paste should attach clipboard images.
+
+    VS Code integrated terminal can deliver a Windows-style Ctrl+V as a raw
+    ``c-v`` keypress to prompt_toolkit instead of as a normal text paste.  On
+    Sangkun's Mac this made screenshot/image clipboard content appear as a
+    Hermes image attachment, while the expected pre-change behaviour is that
+    paste remains text/path-only unless image attach is requested explicitly.
+
+    Keep implicit image paste disabled; explicit image attach still works via
+    ``/paste``, ``/image <path>``, or Alt+V.
+    """
+    return False
 
 
 def _strip_leaked_bracketed_paste_wrappers(text: str) -> str:
@@ -2643,6 +2739,59 @@ def _strip_leaked_bracketed_paste_wrappers(text: str) -> str:
     text = re.sub(r"(^|[\s\n>:\]\)])00~", r"\1", text)
     text = re.sub(r"01~(?=$|[\s\n<\[\(\):;.,!?])", "", text)
     return text
+
+
+_TERMINAL_RESPONSE_FEED_COMPLETE_RE = re.compile(
+    r"(?:"
+    r"\x1b\[\d+;\d+R"
+    r"|\^\[\[\d+;\d+R"
+    r"|\x1b\[<\d+;\d+;\d+[Mm]"
+    r"|\^\[\[<\d+;\d+;\d+[Mm]"
+    r"|<\d+;\d+;\d+[Mm]"
+    r")"
+)
+_TERMINAL_RESPONSE_FEED_PREFIX_RE = re.compile(
+    r"(?:"
+    r"\x1b(?:\[\d*(?:;\d*)?|\[<\d*(?:;\d*){0,2})?"
+    r"|\^\[(?:\[\d*(?:;\d*)?|\[<\d*(?:;\d*){0,2})?"
+    r"|<\d+(?:;\d*){0,2}"
+    r")"
+)
+_TERMINAL_RESPONSE_FEED_MAX_PENDING = 48
+
+
+def _strip_terminal_response_sequences_from_feed(
+    data: str,
+    pending: str = "",
+) -> tuple[str, str]:
+    """Drop CPR/SGR terminal replies before prompt_toolkit turns them into text.
+
+    The submit-time sanitizer catches leaked ``ESC[row;colR`` after the user
+    presses Enter, but in terminals such as VS Code's integrated terminal the
+    bytes can be rendered in the live prompt first as ``^[[50;1R``. Filtering
+    at the vt100 feed boundary prevents those terminal replies from ever
+    entering the editable buffer. ``pending`` carries a short incomplete suffix
+    so replies split across reads are removed once complete.
+    """
+    if not data and not pending:
+        return "", ""
+
+    combined = f"{pending}{data}"
+    if not combined:
+        return "", ""
+
+    cleaned = _TERMINAL_RESPONSE_FEED_COMPLETE_RE.sub("", combined)
+
+    next_pending = ""
+    max_scan = min(len(cleaned), _TERMINAL_RESPONSE_FEED_MAX_PENDING)
+    for size in range(max_scan, 1, -1):
+        suffix = cleaned[-size:]
+        if _TERMINAL_RESPONSE_FEED_PREFIX_RE.fullmatch(suffix):
+            next_pending = suffix
+            cleaned = cleaned[:-size]
+            break
+
+    return cleaned, next_pending
 
 
 def _apply_bracketed_paste_timeout_patch() -> None:
@@ -2715,6 +2864,11 @@ def _apply_bracketed_paste_timeout_patch() -> None:
                 # Normal mode — re-inline prompt_toolkit's normal feed path.
                 # Calling the original feed here would double-buffer after the
                 # bracketed-paste entry transition.
+                pending = getattr(self_parser, "_hermes_terminal_response_pending", "")
+                data, pending = _strip_terminal_response_sequences_from_feed(data, pending)
+                setattr(self_parser, "_hermes_terminal_response_pending", pending)
+                if not data:
+                    return
                 for i, c in enumerate(data):
                     if self_parser._in_bracketed_paste:
                         _patched_vt100_feed(self_parser, data[i:])
@@ -2759,15 +2913,16 @@ _TERMINAL_INPUT_MODE_RESET_SEQ = (
 
 
 def _preserve_ctrl_enter_newline() -> bool:
-    """Detect environments where Ctrl+Enter must produce a newline, not submit.
+    """Detect environments where Ctrl+Enter / pasted LF must produce a newline, not submit.
 
-    Windows Terminal, WSL, SSH sessions, Ghostty, and some modern terminals
-    deliver Ctrl+Enter/Ctrl+J as bare LF (c-j). On those terminals c-j must
-    NOT be bound to submit;
-    binding it to submit makes Ctrl+Enter (intended as 'newline like Alt+Enter')
-    submit instead. Local POSIX TTYs that deliver Enter as LF (docker exec,
-    some thin PTYs without SSH) still need c-j bound to submit, so we keep
-    that binding for those.
+    Windows Terminal, WSL, SSH sessions, Ghostty, VS Code's integrated
+    terminal, and some modern terminals deliver Ctrl+Enter or pasted line
+    endings as bare LF (c-j). On those terminals c-j must NOT be bound to
+    submit; binding it to submit makes Ctrl+Enter (intended as 'newline like
+    Alt+Enter') or a Ctrl+V paste with a trailing newline submit immediately.
+    Local POSIX TTYs that deliver Enter as LF (docker exec, some thin PTYs
+    without SSH) still need c-j bound to submit, so we keep that binding for
+    those.
 
     See issue #22379.
     """
@@ -2779,9 +2934,12 @@ def _preserve_ctrl_enter_newline() -> bool:
         return True
     if os.environ.get("GHOSTTY_RESOURCES_DIR") or os.environ.get("GHOSTTY_BIN_DIR"):
         return True
+    term_program = os.environ.get("TERM_PROGRAM", "").lower()
     if os.environ.get("TERM", "").lower() == "xterm-ghostty":
         return True
-    if os.environ.get("TERM_PROGRAM", "").lower() == "ghostty":
+    if term_program == "ghostty":
+        return True
+    if _is_vscode_integrated_terminal():
         return True
     if "microsoft" in os.environ.get("WSL_DISTRO_NAME", "").lower():
         return True
@@ -2796,6 +2954,53 @@ def _preserve_ctrl_enter_newline() -> bool:
     return False
 
 
+def _wave_korean_enter_delay_enabled() -> bool:
+    """Return True for the Wave/macOS/Korean IME composition-submit workaround.
+
+    Wave Terminal on macOS can deliver the Enter keybinding before the final
+    Korean IME composition update reaches prompt_toolkit. Without a tiny defer,
+    a phrase such as "잠깐" can submit as "잠" while "깐" remains in the input
+    buffer. Keep this narrowly scoped to Sangkun's observed environment.
+    """
+    if sys.platform != "darwin":
+        return False
+    if os.environ.get("HERMES_DISABLE_WAVE_KOREAN_ENTER_DELAY", "").lower() in {"1", "true", "yes", "on"}:
+        return False
+    term_program = os.environ.get("TERM_PROGRAM", "").lower()
+    if "wave" not in term_program and not os.environ.get("WAVETERM"):
+        return False
+    locale_text = " ".join(
+        os.environ.get(name, "") for name in ("LC_ALL", "LC_CTYPE", "LANG")
+    ).lower()
+    return "ko" in locale_text
+
+
+def _is_vscode_integrated_terminal() -> bool:
+    """Return True when running inside VS Code's integrated terminal."""
+    return os.environ.get("TERM_PROGRAM", "").lower() == "vscode" or bool(os.environ.get("VSCODE_IPC_HOOK_CLI"))
+
+
+def _wave_korean_enter_delay_seconds() -> float:
+    """Delay before submitting Enter so Wave/macOS Korean IME can flush.
+
+    Wave appears to deliver the Enter keybinding before the final Korean IME
+    commit is visible to prompt_toolkit. Fixed sleeps of 50 ms, 180 ms, and
+    350 ms were still too short on Sangkun's Wave/macOS setup (for example
+    "된다" submitted as "된", with "다" left in the composer). Default to a
+    more conservative 900 ms while allowing runtime tuning through
+    HERMES_WAVE_KOREAN_ENTER_DELAY_MS.
+    """
+    raw = os.environ.get("HERMES_WAVE_KOREAN_ENTER_DELAY_MS", "").strip()
+    if raw:
+        try:
+            ms = float(raw)
+            if ms >= 0:
+                return min(ms / 1000.0, 3.0)
+        except (TypeError, ValueError):
+            logger.warning("Invalid HERMES_WAVE_KOREAN_ENTER_DELAY_MS=%r; using default", raw)
+    return 0.9
+
+
 def _bind_prompt_submit_keys(kb, handler) -> None:
     """Bind terminal Enter forms to the submit handler.
 
@@ -2803,11 +3008,11 @@ def _bind_prompt_submit_keys(kb, handler) -> None:
     some thin PTYs (docker exec, certain SSH flavors) deliver Enter as LF
     instead of CR — without this, Enter appears dead on those terminals.
 
-    Exception: on Windows, WSL, SSH sessions, Windows Terminal, and Ghostty,
-    c-j is the wire encoding of Ctrl+Enter (a distinct keystroke from
-    plain Enter / c-m). We leave c-j unbound there so the c-j newline
-    handler registered separately can fire — giving the user an
-    Enter-involving newline keystroke without terminal settings changes.
+    Exception: on Windows, WSL, SSH sessions, Windows Terminal, Ghostty, and
+    VS Code's integrated terminal, c-j is the wire encoding of Ctrl+Enter or
+    pasted LF (distinct from plain Enter / c-m). We leave c-j unbound there so
+    the c-j newline handler registered separately can fire — giving the user an
+    Enter-involving newline keystroke and preventing Ctrl+V paste from submitting.
     See _preserve_ctrl_enter_newline() and issue #22379.
     """
     kb.add("enter")(handler)
@@ -3524,36 +3729,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._last_turn_finished_at: Optional[float] = None  # time.time() when the last agent loop finished
         # Initialize SQLite session store early so /title works before first message
         self._session_db = None
-        self._session_db_unavailable = False
         try:
             from hermes_state import SessionDB
             self._session_db = SessionDB()
         except Exception as e:
-            # #41386: a failed session store means the transcript is NOT
-            # persisted to state.db — the live chat looks healthy but resume
-            # later shows a truncated/empty session. A buried log line is not
-            # enough; surface it prominently so the user knows persistence is
-            # off for this run and can fix the store before relying on resume.
-            self._session_db_unavailable = True
             logger.warning("Failed to initialize SessionDB — session will NOT be indexed for search: %s", e)
-            try:
-                # Console is imported at module scope; do NOT re-import it here.
-                # A function-local `import` would make `Console` a local name for
-                # the whole __init__ body and break the earlier `self.console =
-                # Console()` with UnboundLocalError.
-                Console(stderr=True).print(
-                    "[bold yellow]⚠ Session store unavailable[/bold yellow] — "
-                    "this conversation will [bold]NOT be saved[/bold] to disk and "
-                    "cannot be resumed later. Searching past sessions is also disabled.\n"
-                    f"  Reason: {e}\n"
-                    "  Fix the state.db store (e.g. `hermes update` to rebuild the venv) to restore persistence."
-                )
-            except Exception:
-                # Never let the warning path itself break startup.
-                print(
-                    "WARNING: Session store unavailable — this conversation will NOT be "
-                    f"saved to disk and cannot be resumed later. Reason: {e}"
-                )
 
         # Opportunistic state.db maintenance — runs at most once per
         # min_interval_hours, tracked via state_meta in state.db itself so
@@ -3637,6 +3817,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._command_running = False
         self._command_status = ""
         self._attached_images: list[Path] = []
+        self._attached_image_texts: list[str] = []
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
@@ -3728,7 +3909,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if getattr(self, "_resize_recovery_pending", False):
             return
         now = time.monotonic()
-        if hasattr(self, "_app") and self._app and (now - getattr(self, "_last_invalidate", 0.0)) >= min_interval:
+        if hasattr(self, "_app") and self._app and (now - self._last_invalidate) >= min_interval:
             self._last_invalidate = now
             self._app.invalidate()
 
@@ -3806,12 +3987,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         startup UI and ``_replay_output_history`` cannot reconstruct it
         (the banner was never added to ``_OUTPUT_HISTORY``).
 
-        Let prompt_toolkit's own resize path run with its renderer cursor
-        cache intact. Its Application._on_resize() starts with
-        renderer.erase(leave_alternate_screen=False), which needs the cached
-        cursor position to move back to the live prompt origin before
-        erase_down(). Resetting the renderer before that erase loses the
-        origin and can leave stale prompt glyphs after a narrow resize.
+        Instead we just reset prompt_toolkit's renderer cache so the next
+        incremental redraw starts from a clean slate, then let
+        ``original_on_resize`` recalculate layout for the new size.
 
         We also flag ``_status_bar_suppressed_after_resize`` so the dynamic
         status bar and input separator rules stay hidden until the next user
@@ -3822,6 +4000,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         next prompt restores the bar cleanly.
         """
         self._status_bar_suppressed_after_resize = True
+        try:
+            app.renderer.reset(leave_alternate_screen=False)
+        except Exception:
+            pass
+        try:
+            app.invalidate()
+        except Exception:
+            pass
         original_on_resize()
 
     def _schedule_resize_recovery(self, app, original_on_resize, delay: float = 0.12) -> None:
@@ -3894,6 +4080,67 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         filled = round((safe_percent / 100) * width)
         return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
 
+    def _build_daily_usage_bar(self, percent_used: Optional[int], width: int = 10) -> str:
+        """Return the compact daily-limit usage bar shown beside the model."""
+        display_percent = max(0, min(999, int(percent_used or 0)))
+        fill_percent = max(0, min(100, display_percent))
+        filled = round((fill_percent / 100) * width)
+        if display_percent > 0 and filled == 0:
+            filled = 1
+        return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
+
+    @staticmethod
+    def _format_usage_reset_remaining(reset_at_iso, now=None) -> str:
+        """Time until the active rate-limit block renews, e.g. ``2h 9m``.
+
+        ``reset_at_iso`` is the active 5-hour usage block's end time (ISO 8601),
+        i.e. when the rolling quota that drives the daily-usage percentage next
+        resets.  Returns ``""`` when there is no active block or it has already
+        reset, so the status bar simply omits the hint in that case.
+        """
+        if not reset_at_iso:
+            return ""
+        try:
+            reset_dt = datetime.fromisoformat(str(reset_at_iso).replace("Z", "+00:00"))
+        except Exception:
+            return ""
+        if reset_dt.tzinfo is None:
+            reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        remaining = (reset_dt - current).total_seconds()
+        if remaining <= 0:
+            return ""
+        total_minutes = int(remaining // 60)
+        hours, minutes = divmod(total_minutes, 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        return f"{minutes}m"
+
+    def _daily_usage_fragments(self, percent_used: Optional[int], width: int = 10, reset_at: str = ""):
+        """Styled daily-limit bar fragments for the status bar."""
+        if percent_used is None:
+            return []
+        display_percent = max(0, min(999, int(percent_used or 0)))
+        fill_percent = max(0, min(100, display_percent))
+        filled = round((fill_percent / 100) * width)
+        if display_percent > 0 and filled == 0:
+            filled = 1
+        empty = max(0, width - filled)
+        style = self._status_bar_context_style(fill_percent)
+        fragments = [
+            ("class:status-bar-dim", " ["),
+            (style, "█" * filled),
+            ("class:status-bar-dim", "░" * empty),
+            ("class:status-bar-dim", "] "),
+            (style, f"{display_percent}%"),
+        ]
+        remaining = self._format_usage_reset_remaining(reset_at)
+        if remaining:
+            fragments.append(("class:status-bar-dim", f" {remaining}"))
+        return fragments
+
     @staticmethod
     def _format_prompt_elapsed(prompt_start_time: Optional[float], prompt_duration: float, live: bool = False) -> str:
         """Format per-prompt elapsed time for the status bar.
@@ -3945,6 +4192,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         idle = max(0.0, time.time() - last_finished_at)
         return f"✓ {format_duration_compact(idle)}"
 
+    @staticmethod
+    def _format_claude_code_status_model(model_name: str) -> str:
+        """Return the compact status-bar label for Clara/Claude Code lead mode."""
+        model_short = str(model_name or "").strip().split("/")[-1]
+        if model_short.startswith("claude-"):
+            model_short = model_short[len("claude-"):]
+
+        opus_match = re.fullmatch(r"opus-(\d+)[.-](\d+)", model_short)
+        if opus_match:
+            return f"opus-{opus_match.group(1)}.{opus_match.group(2)}"
+
+        return model_short
+
+    def _get_effective_lead_mode(self) -> str:
+        """Return the active fixed-pane lead mode, preferring launcher env pins."""
+        try:
+            from gateway.orchestrator_modes import read_mode
+
+            return os.environ.get("HERMES_LEAD_MODE") or read_mode(get_hermes_home()).get("mode") or ""
+        except Exception:
+            return os.environ.get("HERMES_LEAD_MODE") or ""
+
+    def _get_claude_code_display_model(self, *, compact: bool = True) -> str:
+        """Return the visible model label for the Clara/Claude Code SDK pane."""
+        claude_model = ""
+        try:
+            bridge_cfg = (getattr(self, "config", {}) or {}).get("claude_code_cli") or (getattr(self, "config", {}) or {}).get("clara_cli") or {}
+            if isinstance(bridge_cfg, dict):
+                claude_model = str(bridge_cfg.get("model") or "").strip()
+            if not claude_model:
+                settings_path = Path.home() / ".claude" / "settings.json"
+                if settings_path.exists():
+                    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                    if isinstance(settings, dict):
+                        claude_model = str(settings.get("model") or "").strip()
+        except Exception:
+            claude_model = ""
+
+        if not claude_model:
+            return "Claude Code"
+        if compact:
+            return self._format_claude_code_status_model(claude_model)
+        return claude_model.split("/")[-1] if "/" in claude_model else claude_model
+
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
         # self.model reflects the originally configured model and never
@@ -3958,10 +4249,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if len(model_short) > 26:
             model_short = f"{model_short[:23]}..."
 
+        display_model_short = model_short
+        agent_usage_percent = None
+        agent_usage_label = ""
+        agent_usage_reset_at = ""
+        try:
+            from gateway.orchestrator_modes import MODE_CLARA_LEAD, MODE_HUGO_LEAD
+
+            lead_mode = self._get_effective_lead_mode()
+            if lead_mode == MODE_CLARA_LEAD:
+                # Keep Clara lead compact enough that the status-bar renderer
+                # can preserve the strong/accent color instead of falling back
+                # to a monochrome trimmed string in narrow panes.  Use the
+                # Claude Code model label without the role prefix so
+                # `claude-opus-4-8` renders as `opus-4.8`.
+                display_model_short = self._get_claude_code_display_model(compact=True)
+                usage = _get_agent_daily_usage_status_cached("claude-code")
+                agent_usage_percent = usage.get("percent")
+                agent_usage_label = str(usage.get("label") or "")
+                agent_usage_reset_at = str(usage.get("reset_at") or "")
+                if len(display_model_short) > 26:
+                    display_model_short = f"{display_model_short[:23]}..."
+            elif lead_mode == MODE_HUGO_LEAD:
+                # Default/Codex pane: keep following the configured model.
+                usage = _get_agent_daily_usage_status_cached("codex")
+                agent_usage_percent = usage.get("percent")
+                agent_usage_label = str(usage.get("label") or "")
+                agent_usage_reset_at = str(usage.get("reset_at") or "")
+        except Exception:
+            pass
+
         elapsed_seconds = max(0.0, (datetime.now() - self.session_start).total_seconds())
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
+            "display_model_short": display_model_short,
+            "agent_usage_percent": agent_usage_percent,
+            "agent_usage_label": agent_usage_label,
+            "agent_usage_reset_at": agent_usage_reset_at,
             "duration": format_duration_compact(elapsed_seconds),
             "prompt_elapsed": self._format_prompt_elapsed(
                 getattr(self, "_prompt_start_time", None),
@@ -4240,14 +4565,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             percent_label = f"{percent}%" if percent is not None else "--"
             duration_label = snapshot["duration"]
 
+            display_model_short = snapshot.get("display_model_short") or snapshot["model_short"]
+            agent_usage_percent = snapshot.get("agent_usage_percent")
+            usage_text = ""
+            if agent_usage_percent is not None:
+                usage_percent = max(0, min(999, int(agent_usage_percent)))
+                usage_text = f" {self._build_daily_usage_bar(agent_usage_percent)} {usage_percent}%"
+                reset_remaining = self._format_usage_reset_remaining(
+                    snapshot.get("agent_usage_reset_at")
+                )
+                if reset_remaining:
+                    usage_text += f" {reset_remaining}"
+
             yolo_active = self._is_session_yolo_active()
             if width < 52:
-                text = f"⚕ {snapshot['model_short']} · {duration_label}"
+                text = f"⚕ {display_model_short}{usage_text} · {duration_label}"
                 if yolo_active:
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                # If an external-agent usage bar is present, avoid showing a
+                # second percentage for context pressure in the same compact
+                # footer. Two adjacent percentages look like conflicting quota
+                # readings.
+                parts = [f"⚕ {display_model_short}{usage_text}"]
+                if agent_usage_percent is None:
+                    parts.append(percent_label)
                 compressions = snapshot.get("compressions", 0)
                 if compressions:
                     parts.append(f"🗜️ {compressions}")
@@ -4270,7 +4613,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            parts = [f"⚕ {display_model_short}{usage_text}", context_label]
+            # If an external-agent daily usage bar is present, avoid showing a
+            # second percentage for context pressure. Otherwise keep the normal
+            # context percentage so upstream status-bar tests and non-daily
+            # providers still show context pressure explicitly.
+            if agent_usage_percent is None:
+                parts.append(percent_label)
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -4306,10 +4655,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             duration_label = snapshot["duration"]
             yolo_active = self._is_session_yolo_active()
 
+            display_model_short = snapshot.get("display_model_short") or snapshot["model_short"]
+            agent_usage_percent = snapshot.get("agent_usage_percent")
+            usage_frags = self._daily_usage_fragments(
+                agent_usage_percent,
+                reset_at=str(snapshot.get("agent_usage_reset_at") or ""),
+            )
+
             if width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
-                    ("class:status-bar-strong", snapshot["model_short"]),
+                    ("class:status-bar-strong", display_model_short),
+                    *usage_frags,
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
                 ]
@@ -4326,10 +4683,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     bg_proc_count = snapshot.get("active_background_processes", 0)
                     frags = [
                         ("class:status-bar", " ⚕ "),
-                        ("class:status-bar-strong", snapshot["model_short"]),
-                        ("class:status-bar-dim", " · "),
-                        (self._status_bar_context_style(percent), percent_label),
+                        ("class:status-bar-strong", display_model_short),
+                        *usage_frags,
                     ]
+                    if agent_usage_percent is None:
+                        frags.extend([
+                            ("class:status-bar-dim", " · "),
+                            (self._status_bar_context_style(percent), percent_label),
+                        ])
                     if compressions:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -4355,20 +4716,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     else:
                         context_label = "ctx --"
 
-                    bar_style = self._status_bar_context_style(percent)
                     compressions = snapshot.get("compressions", 0)
                     bg_count = snapshot.get("active_background_tasks", 0)
                     bg_proc_count = snapshot.get("active_background_processes", 0)
                     frags = [
                         ("class:status-bar", " ⚕ "),
-                        ("class:status-bar-strong", snapshot["model_short"]),
+                        ("class:status-bar-strong", display_model_short),
+                        *usage_frags,
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
-                        ("class:status-bar-dim", " │ "),
-                        (bar_style, self._build_context_bar(percent)),
-                        ("class:status-bar-dim", " "),
-                        (bar_style, percent_label),
                     ]
+                    # Context pressure is shown once, as the raw token count
+                    # (e.g. 172K/1M). The redundant bar+% graphic is intentionally
+                    # omitted so the footer never shows two context indicators.
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -4562,6 +4922,65 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         it's a no-op for rendering — kept so the agent's clear callback is bound
         symmetrically with the show callback (and so future REPL UIs can hook it)."""
         return
+
+    def _render_claude_bridge_progress(self, event_type: str, text: str, data: dict | None = None) -> None:
+        """Persist Clara/Claude Code progress into chat scrollback.
+
+        Deprecated for the live hermes-claude path: boxed progress around every
+        heartbeat made the pane look like empty giant panels.  Kept for older
+        callers, but it now renders as compact scrollback text.
+        """
+        self._print_claude_bridge_status_line(event_type, text, data)
+
+    def _print_claude_bridge_status_line(self, event_type: str, text: str, data: dict | None = None) -> None:
+        """Print a compact non-boxed Clara SDK status line.
+
+        Assistant text deltas use the normal Hermes response box.  Operational
+        events (SDK start, thinking, tool starts/completions) must remain visible
+        in scrollback as small lines so the pane does not look asleep, but they
+        must not create additional large boxes.
+        """
+        msg = " ".join(str(text or "").split())
+        if not msg:
+            return
+        now = time.monotonic()
+        key = f"{event_type}:{msg}"
+        last_key = getattr(self, "_last_claude_bridge_progress_key", "")
+        last_at = float(getattr(self, "_last_claude_bridge_progress_at", 0.0) or 0.0)
+        force = event_type not in {"sdk.text_delta", "sdk.thinking", "sdk.stream_event", "heartbeat"}
+        if key == last_key and not force and (now - last_at) < 4.0:
+            return
+        self._last_claude_bridge_progress_key = key
+        self._last_claude_bridge_progress_at = now
+        label = "sdk"
+        if "tool" in event_type:
+            label = "tool"
+        elif "started" in event_type or "spawned" in event_type:
+            label = "start"
+        elif "completed" in event_type or "result" in event_type:
+            label = "done"
+        if len(msg) > 110:
+            msg = msg[:107] + "..."
+        _cprint(f"  ┊ 🟪 {label:<5} {msg}")
+
+    def _print_claude_tool_progress_line(self, phase: str, tool_name: str, args: dict, preview: str = "", *, duration: float = 0.0, result=None) -> None:
+        """Print one compact Hermes-style line for Claude SDK tool activity."""
+        try:
+            from agent.display import get_cute_tool_message, get_tool_emoji
+            if phase == "completed":
+                line = get_cute_tool_message(tool_name, args, duration, result=result)
+            else:
+                emoji = get_tool_emoji(tool_name)
+                detail = preview or tool_name
+                if len(detail) > 90:
+                    detail = detail[:87] + "..."
+                if tool_name == "terminal" and args.get("command"):
+                    line = f"┊ {emoji} $         {detail}  running"
+                else:
+                    line = f"┊ {emoji} {tool_name:<9} {detail}  running"
+            _cprint(f"  {line}")
+        except Exception:
+            _cprint(f"  ┊ 🟪 {phase:<9} {preview or tool_name}")
 
     # ── Streaming display ────────────────────────────────────────────────
 
@@ -5234,10 +5653,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # Get terminal working directory (where commands will execute)
             cwd = os.getenv("TERMINAL_CWD", os.getcwd())
             
-            # Build and display the banner
+            # Build and display the banner.  Fixed Clara panes keep the
+            # underlying Hermes provider on the configured Codex runtime while
+            # routing normal turns through Claude Code SDK, so use a display
+            # model here instead of self.model when the launcher env pins
+            # Clara lead.
+            banner_model = self.model
+            try:
+                from gateway.orchestrator_modes import MODE_CLARA_LEAD
+                if self._get_effective_lead_mode() == MODE_CLARA_LEAD:
+                    banner_model = self._get_claude_code_display_model(compact=False)
+            except Exception:
+                banner_model = self.model
             build_welcome_banner(
                 console=self.console,
-                model=self.model,
+                model=banner_model,
                 cwd=cwd,
                 tools=tools,
                 enabled_toolsets=self.enabled_toolsets,
@@ -5386,6 +5816,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return True
         self._image_counter -= 1
         return False
+
+    def _save_clipboard_image_to_file(self) -> Path | None:
+        """Save the clipboard image and return its path without attaching it."""
+        from hermes_cli.clipboard import save_clipboard_image
+
+        img_dir = get_hermes_home() / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        self._image_counter += 1
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        img_path = img_dir / f"clip_{ts}_{self._image_counter}.png"
+        if save_clipboard_image(img_path):
+            return img_path
+        self._image_counter -= 1
+        return None
+
+    def _analyze_image_as_input_text(self, img_path: Path, *, user_text: str = "", announce: bool = True) -> str:
+        """Return the text-only vision summary Hermes should paste/send for an image.
+
+        Sangkun's VS Code terminal workflow expects screenshot/image paste to
+        become text context, not a native image attachment or an editor preview.
+        Keep the original image path in the text so the agent can re-open it
+        with vision_analyze if more detail is needed.
+        """
+        return self._preprocess_images_with_vision(user_text, [img_path], announce=announce)
+
+    def _try_insert_clipboard_image_text(self, buffer=None) -> bool:
+        """Save clipboard image, summarize it, and insert/queue text instead of attaching."""
+        img_path = self._save_clipboard_image_to_file()
+        if img_path is None:
+            return False
+        text = self._analyze_image_as_input_text(img_path, announce=True)
+        if buffer is not None:
+            if buffer.text and buffer.cursor_position > 0 and buffer.text[buffer.cursor_position - 1] not in {"\n", " "}:
+                buffer.insert_text("\n")
+            buffer.insert_text(text)
+        else:
+            self._attached_image_texts.append(text)
+        return True
 
 
     def _resolve_checkpoint_ref(self, ref: str, checkpoints: list) -> str | None:
@@ -5553,8 +6021,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             tool_count = len(tools) if tools else 0
             tool_status = f"{tool_count} tools"
 
-        # Format model name (shorten if needed)
+        # Format model name (shorten if needed).  In a fixed Clara pane the
+        # underlying Hermes inference provider remains the real configured
+        # provider (usually openai-codex) so the local Claude Code bridge can be
+        # used without registering a fake provider.  The startup banner is a
+        # display surface, so override only the visible label here.
         model_short = self.model.split("/")[-1] if "/" in self.model else self.model
+        provider_display = self.provider
+        try:
+            from gateway.orchestrator_modes import MODE_CLARA_LEAD
+            if self._get_effective_lead_mode() == MODE_CLARA_LEAD:
+                model_short = self._get_claude_code_display_model(compact=False)
+                provider_display = "claude-code-sdk"
+        except Exception:
+            provider_display = self.provider
         if len(model_short) > 30:
             model_short = model_short[:27] + "..."
 
@@ -5577,7 +6057,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if self.enabled_toolsets and "all" not in self.enabled_toolsets:
             toolsets_info = f" [dim {separator_color}]·[/] [{label_color}]toolsets: {', '.join(self.enabled_toolsets)}[/]"
 
-        provider_info = f" [dim {separator_color}]·[/] [dim]provider: {self.provider}[/]"
+        provider_info = f" [dim {separator_color}]·[/] [dim]provider: {provider_display}[/]"
         if self._provider_source:
             provider_info += f" [dim {separator_color}]·[/] [dim]auth: {self._provider_source}[/]"
 
@@ -5852,19 +6332,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if not self._session_db:
             return []
         try:
-            from hermes_cli.session_listing import query_session_listing
-
-            return query_session_listing(
-                self._session_db,
+            sessions = self._session_db.list_sessions_rich(
                 source="cli",
-                current_session_id=self.session_id,
-                include_all_sources=False,
-                include_unnamed=True,
-                limit=limit,
                 exclude_sources=["tool"],
+                limit=limit,
             )
         except Exception:
             return []
+        return [s for s in sessions if s.get("id") != self.session_id]
 
     def _show_recent_sessions(self, *, reason: str = "history", limit: int = 10) -> bool:
         """Render recent sessions inline from the active chat TUI.
@@ -6021,18 +6496,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         old_session_id = self.session_id
         if self._session_db and old_session_id:
-            # Flush any un-persisted messages from the current turn to the
-            # old session *before* rotating.  /new can be called mid-turn
-            # when _flush_messages_to_session_db() has not yet run — without
-            # this, messages generated during the current turn are silently
-            # lost on session rotation (#47202).
-            if self.agent:
-                try:
-                    self.agent._flush_messages_to_session_db(
-                        self.conversation_history
-                    )
-                except Exception:
-                    pass  # best-effort
             try:
                 self._session_db.end_session(old_session_id, "new_session")
             except Exception:
@@ -6434,17 +6897,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 pass
 
         in_main_thread = threading.current_thread() is threading.main_thread()
-
-        # Slash-worker guard (#23185 / billing auto-reload hang): when a
-        # prompt_toolkit app is running but we're on a non-main thread (the
-        # process_loop / TUI slash-worker daemon thread), stdin is owned by the
-        # event loop / JSON-RPC pipe.  A bare input() there blocks forever until
-        # the worker's 45s timeout fires.  We cannot safely prompt off the main
-        # thread, so cancel cleanly (None) instead of hanging — mirrors the
-        # _stdin_fallback discipline in _prompt_text_input_modal.
-        if self._app and not in_main_thread:
-            self._invalidate()
-            return None
 
         if self._app and in_main_thread:
             from prompt_toolkit.application import run_in_terminal
@@ -7017,7 +7469,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             try:
                 if ctx is None:
                     raise RuntimeError("inventory context unavailable")
-                providers = build_models_payload(ctx)["providers"]
+                providers = build_models_payload(ctx, max_models=50)["providers"]
             except Exception:
                 providers = []
 
@@ -7187,6 +7639,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     else f"    {line}")
         if result.success and result.requires_new_session:
             _cprint("    Tip: `/reset` starts a new session immediately.")
+
+    def _handle_natural_lead_mode_text(self, text: str) -> bool:
+        """Handle natural Korean/English lead-mode commands before LLM routing.
+
+        This keeps `현재모드` as a local UI/control command. Sangkun expects
+        this phrase to report the Hugo/Clara lead runtime mode, not the
+        Wave-board interaction mode.
+        """
+        if not text or _looks_like_slash_command(text):
+            return False
+        try:
+            from gateway.orchestrator_modes import handle_mode_text
+
+            reply = handle_mode_text(text, source="cli:natural")
+        except Exception as exc:
+            _cprint(f"❌ Could not inspect orchestrator mode: {exc}")
+            return True
+        if not reply:
+            return False
+        _cprint(f"⚙️  현재 모드\n{reply}")
+        return True
 
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""
@@ -7400,9 +7873,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     ctx_len = None
                     if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
                         ctx_len = self.agent.context_compressor.context_length
+                    banner_model = self.model
+                    try:
+                        from gateway.orchestrator_modes import MODE_CLARA_LEAD
+                        if self._get_effective_lead_mode() == MODE_CLARA_LEAD:
+                            banner_model = self._get_claude_code_display_model(compact=False)
+                    except Exception:
+                        banner_model = self.model
                     build_welcome_banner(
                         console=cc,
-                        model=self.model,
+                        model=banner_model,
                         cwd=cwd,
                         tools=tools,
                         enabled_toolsets=self.enabled_toolsets,
@@ -7513,6 +7993,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_sessions_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
+        elif canonical == "model-swap":
+            self._handle_model_swap_command(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
         elif canonical == "gquota":
@@ -7593,8 +8075,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._show_usage()
         elif canonical == "credits":
             self._show_credits()
-        elif canonical == "billing":
-            self._show_billing(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "copy":
@@ -8514,7 +8994,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         if not view.logged_in:
             print()
-            _cprint(f"  💳 {_d('Not logged into Nous Portal.')}")
+            print(f"  💳 {_DIM}Not logged into Nous Portal.{_RST}")
             print("  Run `hermes portal` to log in, then /credits.")
             return
 
@@ -8575,628 +9055,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 print(f"  Top-up URL: {view.topup_url}")
         else:
             print("  🟡 Cancelled. No credits added.")
-
-    # ------------------------------------------------------------------
-    # /billing — Phase 2b terminal billing (CLI surface, all 5 screens)
-    # ------------------------------------------------------------------
-
-    def _show_billing(self, command: str = "/billing"):
-        """`/billing` — terminal billing for Nous (one interactive modal).
-
-        ZERO sub-commands: any argument is ignored. Bare ``/billing`` always
-        opens the Overview (Screen 1), whose numbered menu is the *only* way to
-        reach the Buy / Auto-reload / Monthly-limit sub-screens. (Per the unified
-        UX spec §0.4 — ``/billing buy`` etc. are gone; we don't error on a stray
-        arg, we just open the menu.)
-
-        Interactive CLI uses the prompt_toolkit modal; non-interactive contexts
-        (TUI slash-worker / no live app) render text + the portal deep-link, never
-        prompting (the URL is the affordance), same discipline as ``_show_credits``.
-        All money is Decimal end-to-end; the terminal never collects card details.
-        """
-        from agent.billing_view import build_billing_state
-
-        state = build_billing_state()
-        if not state.logged_in:
-            print()
-            if state.error:
-                _msg = f"Couldn't load billing: {state.error}"
-                _cprint(f"  💳 {_d(_msg)}")
-            else:
-                _cprint(f"  💳 {_d('Not logged into Nous Portal.')}")
-                print("  Run `hermes portal` to log in, then /billing.")
-            return
-
-        # Any sub-arg is intentionally ignored — always open the menu.
-        self._billing_overview(state)
-
-    def _billing_portal_hint(self, state, *, reason: str = "") -> None:
-        """Print a portal deep-link line (the funnel for portal-only actions)."""
-        url = getattr(state, "portal_url", None)
-        if not url:
-            return
-        if reason:
-            print(f"  {reason}")
-        print(f"  Manage on portal: {url}")
-
-    def _billing_overview(self, state):
-        """Screen 1 — overview: balance, spend bar, role-gated action menu."""
-        from agent.billing_view import format_money
-
-        print()
-        _cprint(f"  💳 {_b('Usage credits')}")
-        print(f"  {'─' * 41}")
-
-        cap = state.monthly_cap
-        if cap is not None and cap.limit_usd is not None:
-            spent = format_money(cap.spent_this_month_usd)
-            limit = format_money(cap.limit_usd)
-            ceiling = " (default ceiling)" if cap.is_default_ceiling else ""
-            bar, pct = self._billing_spend_bar(
-                cap.spent_this_month_usd, cap.limit_usd
-            )
-            print(f"  {spent} of {limit} used{ceiling}   {bar} {pct}%")
-
-        print(f"  Balance: {format_money(state.balance_usd)}")
-
-        ar = state.auto_reload
-        if ar is not None:
-            if ar.enabled:
-                print(
-                    f"  Auto-reload: on — below {format_money(ar.threshold_usd)} "
-                    f"→ reload to {format_money(ar.reload_to_usd)}"
-                )
-            else:
-                print("  Auto-reload: off")
-
-        if state.org_name:
-            role = (state.role or "").title()
-            _org_line = f"Org: {state.org_name}{f' · {role}' if role else ''}"
-            _cprint(f"  {_d(_org_line)}")
-        print(f"  {'─' * 41}")
-
-        # Action gating: admin + kill-switch for charge/auto-reload; everyone gets portal.
-        if not state.is_admin:
-            _cprint(f"  {_d('Billing actions require an org admin/owner.')}")
-            self._billing_portal_hint(state)
-            return
-        if not state.cli_billing_enabled:
-            _cprint(f"  {_d('Terminal billing is turned off for this org.')}")
-            self._billing_portal_hint(state, reason="Enable it on the portal to buy credits here.")
-            return
-
-        # Optimistic funnel: no card on file → a charge will 403 no_payment_method.
-        # Surface that up front (with the portal link) but DON'T hide Buy — /state.card
-        # can't fully prove CLI-chargeability, so we advise rather than gate.
-        if state.card is None:
-            _cprint(
-                f"  {_d('No saved card for terminal charges yet — set one up on the portal first.')}"
-            )
-            self._billing_portal_hint(state)
-
-        # Non-interactive (slash-worker / no live app): no modal, no sub-command
-        # advertising — just the portal funnel (the URL is the affordance).
-        if not getattr(self, "_app", None):
-            self._billing_portal_hint(state)
-            return
-
-        choices = [
-            ("buy", "Buy credits", "purchase a one-time credit top-up"),
-            ("auto", "Adjust auto-reload", "configure automatic top-ups"),
-            ("limit", "Adjust monthly limit", "show the monthly spend cap (read-only)"),
-            ("portal", "Manage on portal", "open the billing page in your browser"),
-            ("cancel", "Cancel", "do nothing"),
-        ]
-        # The overview summary is already printed above; the modal only needs to
-        # present the action menu — repeating the title/balance reads as a dupe.
-        raw = self._prompt_text_input_modal(
-            title="💳 Choose an action", detail="",
-            choices=choices,
-        )
-        choice = self._normalize_slash_confirm_choice(raw, choices)
-        if choice == "buy":
-            self._billing_buy_flow(state)
-        elif choice == "auto":
-            self._billing_auto_reload_flow(state)
-        elif choice == "limit":
-            self._billing_limit_screen(state)
-        elif choice == "portal":
-            self._billing_open_portal(state)
-        else:
-            print("  🟡 Cancelled.")
-
-    def _billing_spend_bar(self, spent, limit, *, cells: int = 10):
-        """Render a 10-cell `█`/`░` spend bar + integer percent from spent/limit.
-
-        Returns ``(bar, pct)`` where ``bar`` is like ``[████░░░░░░]`` and ``pct``
-        is the spent/limit percentage clamped to 0..100. Box-drawing glyphs are
-        not SGR codes, so this is leak-safe even without ``_b()``/``_d()``.
-        """
-        from decimal import Decimal
-
-        try:
-            s = Decimal(str(spent)) if spent is not None else Decimal("0")
-            l = Decimal(str(limit)) if limit is not None else Decimal("0")
-        except Exception:
-            s, l = Decimal("0"), Decimal("0")
-        if l <= 0:
-            pct = 0
-        else:
-            pct = int((s / l) * 100)
-        pct = max(0, min(100, pct))
-        filled = int(round(pct / 100 * cells))
-        filled = max(0, min(cells, filled))
-        bar = ("█" * filled) + ("░" * (cells - filled))
-        return bar, pct
-
-    def _billing_open_portal(self, state):
-        url = getattr(state, "portal_url", None)
-        if not url:
-            print("  No portal URL available.")
-            return
-        opened = False
-        try:
-            import webbrowser
-
-            opened = webbrowser.open(url)
-        except Exception:
-            opened = False
-        if not opened:
-            print(f"  Open this URL: {url}")
-        print("  Complete billing changes in the browser.")
-
-    def _billing_require_admin(self, state) -> bool:
-        """Guard charge/auto-reload entry points; print + return False if blocked."""
-        if not state.is_admin:
-            print()
-            _cprint(f"  💳 {_d('Billing actions require an org admin/owner.')}")
-            self._billing_portal_hint(state)
-            return False
-        if not state.cli_billing_enabled:
-            print()
-            _cprint(f"  💳 {_d('Terminal billing is turned off for this org.')}")
-            self._billing_portal_hint(state, reason="Enable it on the portal first.")
-            return False
-        return True
-
-    def _billing_buy_flow(self, state):
-        """Screen 2 (preset select) → Screen 3 (confirm + charge + poll)."""
-        from agent.billing_view import format_money, validate_charge_amount
-
-        if not self._billing_require_admin(state):
-            return
-
-        # Screen 3 — preset selection.
-        if not getattr(self, "_app", None):
-            presets = ", ".join(format_money(p) for p in state.charge_presets)
-            print()
-            _cprint(f"  💳 {_b('Buy usage credits')}")
-            print(f"  Presets: {presets}")
-            print("  Run this in the interactive CLI to complete a purchase.")
-            self._billing_portal_hint(state)
-            return
-
-        preset_choices = []
-        for p in state.charge_presets:
-            preset_choices.append((str(p), format_money(p), "one-time credit purchase"))
-        preset_choices.append(("custom", "Custom amount…", "enter your own amount"))
-        preset_choices.append(("cancel", "Cancel", "do nothing"))
-
-        card = state.card
-        detail = f"Payment: {card.masked}" if card else "No saved card on file"
-        raw = self._prompt_text_input_modal(
-            title="💳 Buy usage credits", detail=detail, choices=preset_choices,
-        )
-        choice = self._normalize_slash_confirm_choice(raw, preset_choices)
-        if not choice or choice == "cancel":
-            print("  🟡 Cancelled. No credits added.")
-            return
-
-        from decimal import Decimal
-
-        if choice == "custom":
-            entered = self._prompt_text_input("  Amount (USD): ")
-            if entered is None:
-                # None = cancelled (e.g. slash-worker can't prompt off-thread).
-                print("  🟡 Cancelled. No credits added.")
-                return
-            v = validate_charge_amount(
-                entered or "", min_usd=state.min_usd, max_usd=state.max_usd
-            )
-            if not v.ok:
-                print(f"  🔴 {v.error}")
-                return
-            amount = v.amount
-        else:
-            try:
-                amount = Decimal(choice)
-            except Exception:
-                print("  🔴 Invalid selection.")
-                return
-
-        self._billing_confirm_and_charge(state, amount)
-
-    def _billing_confirm_and_charge(self, state, amount):
-        """Screen 3 — confirm total + consent, charge, then poll to settlement."""
-        from agent.billing_view import format_money, new_idempotency_key
-
-        card = state.card
-        print()
-        _cprint(f"  💳 {_b('Confirm purchase')}")
-        print(f"  {'─' * 41}")
-        print(f"  Total: {format_money(amount)}")
-        if card:
-            print(f"  Payment: {card.masked}")
-        print(f"  {'─' * 41}")
-        _consent = (
-            "By confirming, you allow Nous Research to charge your card."
-        )
-        _cprint(f"  {_d(_consent)}")
-
-        confirm_choices = [
-            ("pay", f"Pay {format_money(amount)} now", "submit the charge"),
-            ("cancel", "Go back", "do not charge"),
-        ]
-        if not getattr(self, "_app", None):
-            print("  Run in the interactive CLI to confirm a purchase.")
-            return
-        raw = self._prompt_text_input_modal(
-            title=f"💳 Pay {format_money(amount)}?",
-            detail=(card.masked if card else "no saved card"),
-            choices=confirm_choices,
-        )
-        choice = self._normalize_slash_confirm_choice(raw, confirm_choices)
-        if choice != "pay":
-            print("  🟡 Cancelled. No credits added.")
-            return
-
-        # Submit the charge with a fresh idempotency key (reused on retry).
-        from hermes_cli.nous_billing import (
-            BillingError,
-            BillingScopeRequired,
-            post_charge,
-        )
-
-        key = new_idempotency_key()
-        try:
-            result = post_charge(amount_usd=amount, idempotency_key=key)
-        except BillingScopeRequired:
-            self._billing_handle_scope_required(state)
-            return
-        except BillingError as exc:
-            self._billing_render_charge_error(state, exc)
-            return
-
-        charge_id = result.get("chargeId")
-        if not charge_id:
-            print("  🔴 No charge id returned; please check the portal.")
-            return
-        _cprint(f"  {_d('Charge submitted — confirming settlement…')}")
-        self._billing_poll_charge(state, charge_id, amount)
-
-    def _billing_poll_charge(self, state, charge_id, amount):
-        """Poll loop: 2s interval, 5-min cap, cancellable. settled = ledger truth."""
-        import time as _time
-
-        from agent.billing_view import format_money
-        from hermes_cli.nous_billing import (
-            BillingError,
-            BillingRateLimited,
-            get_charge_status,
-        )
-
-        deadline = _time.time() + 300  # 5-minute cap
-        interval = 2.0
-        while _time.time() < deadline:
-            try:
-                status = get_charge_status(charge_id)
-            except BillingRateLimited as exc:
-                # Retry-after, NOT a failure — back off and keep polling.
-                wait = exc.retry_after or 5
-                _time.sleep(min(wait, 30))
-                continue
-            except BillingError as exc:
-                print(f"  🔴 Could not check the charge: {exc}")
-                return
-
-            state_str = status.get("status")
-            if state_str == "settled":
-                amt = status.get("amountUsd")
-                from agent.billing_view import parse_money
-
-                shown = format_money(parse_money(amt)) if amt else format_money(amount)
-                print(f"  ✅ {shown} in credits added.")
-                return
-            if state_str == "failed":
-                self._billing_render_charge_failed(state, status.get("reason"))
-                return
-            # pending → wait and poll again
-            _time.sleep(interval)
-
-        # Past the cap with no terminal state = timeout (not an error).
-        print(f"  🟡 Still processing after 5 minutes — this is a timeout, not a "
-              f"failure. Check /billing or the portal shortly.")
-        self._billing_portal_hint(state)
-
-    def _billing_render_charge_failed(self, state, reason):
-        """Branch the poll `failed` reasons to the right copy + portal funnel."""
-        reason = (reason or "").strip()
-        if reason == "authentication_required":
-            print("  🔴 Your bank requires verification (3DS). Complete it on the "
-                  "portal to finish this purchase.")
-        elif reason == "payment_method_expired":
-            print("  🔴 Your card has expired. Update it on the portal.")
-        elif reason == "card_declined":
-            print("  🔴 Your card was declined. Try another card on the portal.")
-        else:
-            print(f"  🔴 The charge didn't go through ({reason or 'processing_error'}).")
-        self._billing_portal_hint(state)
-
-    def _billing_render_charge_error(self, state, exc):
-        """Render a typed BillingError at submit time (pre-poll)."""
-        from hermes_cli.nous_billing import BillingRateLimited
-
-        code = getattr(exc, "error", None)
-        portal_url = getattr(exc, "portal_url", None) or getattr(state, "portal_url", None)
-        if code == "no_payment_method":
-            print("  💳 No saved card for terminal charges yet. Set one up on the "
-                  "portal (one-time credit buys don't save a reusable card).")
-        elif code == "cli_billing_disabled":
-            print("  🔴 Terminal billing is turned off for this org — an admin must enable it on the portal.")
-        elif code == "monthly_cap_exceeded":
-            remaining = (getattr(exc, "payload", {}) or {}).get("remainingUsd")
-            if remaining is not None:
-                print(f"  🔴 Monthly spend cap reached — ${remaining} headroom left.")
-            else:
-                print("  🔴 Monthly spend cap reached.")
-        elif isinstance(exc, BillingRateLimited):
-            wait = getattr(exc, "retry_after", None)
-            mins = f" (try again in ~{max(1, round(wait / 60))} min)" if wait else ""
-            print(f"  🟡 Too many charges right now{mins}. This isn't a payment failure.")
-        else:
-            print(f"  🔴 {exc}")
-        if portal_url:
-            print(f"  Portal: {portal_url}")
-
-    def _billing_handle_scope_required(self, state):
-        """403 insufficient_scope → lazy step-up re-auth (plan D-A)."""
-        print()
-        print("  💳 Terminal billing needs an extra permission (billing:manage).")
-        _scope_msg = (
-            "An org admin/owner must tick \"Allow terminal billing\" during "
-            "login."
-        )
-        _cprint(f"  {_d(_scope_msg)}")
-        if not getattr(self, "_app", None):
-            print("  Run `hermes portal` and approve terminal billing, then retry.")
-            return
-        confirm_choices = [
-            ("yes", "Re-authorize now", "open the portal to grant billing access"),
-            ("no", "Not now", "cancel"),
-        ]
-        raw = self._prompt_text_input_modal(
-            title="💳 Grant terminal billing access?",
-            detail="Opens the portal device-authorization page.",
-            choices=confirm_choices,
-        )
-        choice = self._normalize_slash_confirm_choice(raw, confirm_choices)
-        if choice != "yes":
-            print("  🟡 Cancelled.")
-            return
-        try:
-            from hermes_cli.auth import step_up_nous_billing_scope
-
-            granted = step_up_nous_billing_scope(open_browser=True)
-        except Exception as exc:
-            print(f"  🔴 Re-authorization failed: {exc}")
-            return
-        if granted:
-            print("  ✅ Billing permission granted.")
-            # Step-up only grants the billing:manage TOKEN scope; the ORG
-            # kill-switch (cli_billing_enabled) is a separate gate. Re-fetch
-            # /state so we don't over-promise when a charge would still hit
-            # cli_billing_disabled.
-            from agent.billing_view import build_billing_state
-
-            fresh = build_billing_state()
-            if fresh.logged_in and fresh.cli_billing_enabled:
-                print("  Run /billing buy again to continue.")
-            else:
-                print("  🟡 Permission granted, but terminal billing is still turned "
-                      "off for this org. Enable it in the portal, then run /billing again.")
-                self._billing_portal_hint(fresh)
-        else:
-            print("  🟡 Terminal billing was not granted (an admin must tick the box).")
-
-    def _billing_auto_reload_flow(self, state):
-        """Screen 4 — auto-reload config: threshold + reload-to → PATCH.
-
-        Prefills the current values from ``state.auto_reload``. Validates both
-        amounts (2dp, within bounds, ``reload_to > threshold``). When auto-reload
-        is already on, offers a "Turn off" path (PATCH ``enabled:false``).
-        """
-        from agent.billing_view import format_money, validate_charge_amount
-
-        if not self._billing_require_admin(state):
-            return
-
-        card = state.card
-        ar = state.auto_reload
-        currently_on = bool(ar and ar.enabled)
-
-        print()
-        _cprint(f"  💳 {_b('Auto-reload')}")
-        print(f"  {'─' * 41}")
-        _cprint(f"  {_d('Automatically buy more credits when your balance is low.')}")
-        if card:
-            print(f"  Card on file: {card.masked}")
-        else:
-            print("  No saved card — set one up on the portal first.")
-            self._billing_portal_hint(state)
-            return
-        if currently_on:
-            print(
-                f"  Currently: below {format_money(ar.threshold_usd)} → "
-                f"reload to {format_money(ar.reload_to_usd)}"
-            )
-
-        if not getattr(self, "_app", None):
-            print("  Run in the interactive CLI to configure auto-reload.")
-            self._billing_portal_hint(state)
-            return
-
-        # When already enabled, let the user turn it off without re-entering values.
-        if currently_on:
-            top_choices = [
-                ("edit", "Edit thresholds", "change when / how much to reload"),
-                ("off", "Turn off", "disable auto-reload"),
-                ("cancel", "Cancel", "do nothing"),
-            ]
-            raw = self._prompt_text_input_modal(
-                title="💳 Auto-reload",
-                detail=(
-                    f"On — below {format_money(ar.threshold_usd)} → "
-                    f"reload to {format_money(ar.reload_to_usd)}"
-                ),
-                choices=top_choices,
-            )
-            top = self._normalize_slash_confirm_choice(raw, top_choices)
-            if top == "off":
-                self._billing_auto_reload_disable(state)
-                return
-            if top != "edit":
-                print("  🟡 Cancelled.")
-                return
-
-        # Field 1 — threshold (prefilled when editing an existing config).
-        cur_thr = format_money(ar.threshold_usd) if currently_on else None
-        thr_prompt = "  When balance falls below (USD)"
-        thr_prompt += f" [{cur_thr}]: " if cur_thr else ": "
-        threshold_raw = self._prompt_text_input(thr_prompt)
-        if threshold_raw is None:
-            # None = cancelled (e.g. slash-worker can't prompt off-thread).
-            print("  🟡 Cancelled.")
-            return
-        if not (threshold_raw or "").strip() and currently_on:
-            threshold_amt = ar.threshold_usd  # keep current value on empty input
-        else:
-            tv = validate_charge_amount(
-                threshold_raw or "", min_usd=state.min_usd, max_usd=state.max_usd
-            )
-            if not tv.ok or tv.amount is None:
-                print(f"  🔴 {tv.error}")
-                return
-            threshold_amt = tv.amount
-
-        # Field 2 — reload-to (prefilled when editing an existing config).
-        cur_rel = format_money(ar.reload_to_usd) if currently_on else None
-        rel_prompt = "  Reload balance to (USD)"
-        rel_prompt += f" [{cur_rel}]: " if cur_rel else ": "
-        reload_raw = self._prompt_text_input(rel_prompt)
-        if reload_raw is None:
-            print("  🟡 Cancelled.")
-            return
-        if not (reload_raw or "").strip() and currently_on:
-            reload_amt = ar.reload_to_usd  # keep current value on empty input
-        else:
-            rv = validate_charge_amount(
-                reload_raw or "", min_usd=state.min_usd, max_usd=state.max_usd
-            )
-            if not rv.ok or rv.amount is None:
-                print(f"  🔴 {rv.error}")
-                return
-            reload_amt = rv.amount
-
-        if reload_amt is None or threshold_amt is None or reload_amt <= threshold_amt:
-            print("  🔴 Reload-to amount must be greater than the threshold.")
-            return
-
-        print()
-        _ar_consent = (
-            f"By confirming, you authorize Nous Research to charge {card.masked} "
-            f"whenever your balance reaches {format_money(threshold_amt)}. "
-            f"Turn off any time here or on the portal."
-        )
-        _cprint(f"  {_d(_ar_consent)}")
-        confirm_choices = [
-            ("agree", "Agree and turn on", "enable auto-reload"),
-            ("cancel", "Cancel", "do nothing"),
-        ]
-        raw = self._prompt_text_input_modal(
-            title="💳 Turn on auto-reload?",
-            detail=f"Below {format_money(threshold_amt)} → reload to {format_money(reload_amt)}",
-            choices=confirm_choices,
-        )
-        choice = self._normalize_slash_confirm_choice(raw, confirm_choices)
-        if choice != "agree":
-            print("  🟡 Cancelled.")
-            return
-
-        from hermes_cli.nous_billing import (
-            BillingError,
-            BillingScopeRequired,
-            patch_auto_top_up,
-        )
-
-        try:
-            patch_auto_top_up(
-                enabled=True, threshold=float(threshold_amt), top_up_amount=float(reload_amt)
-            )
-        except BillingScopeRequired:
-            self._billing_handle_scope_required(state)
-            return
-        except BillingError as exc:
-            self._billing_render_charge_error(state, exc)
-            return
-        print(f"  ✅ Auto-reload on: below {format_money(threshold_amt)} → "
-              f"reload to {format_money(reload_amt)}.")
-
-    def _billing_auto_reload_disable(self, state):
-        """Turn off auto-reload (PATCH ``enabled:false``).
-
-        The endpoint requires ``threshold``/``topUpAmount`` in the body even when
-        disabling, so we echo back the current values (falling back to 0).
-        """
-        from hermes_cli.nous_billing import (
-            BillingError,
-            BillingScopeRequired,
-            patch_auto_top_up,
-        )
-
-        ar = state.auto_reload
-        thr = float(ar.threshold_usd) if ar and ar.threshold_usd is not None else 0.0
-        rel = float(ar.reload_to_usd) if ar and ar.reload_to_usd is not None else 0.0
-        try:
-            patch_auto_top_up(enabled=False, threshold=thr, top_up_amount=rel)
-        except BillingScopeRequired:
-            self._billing_handle_scope_required(state)
-            return
-        except BillingError as exc:
-            self._billing_render_charge_error(state, exc)
-            return
-        print("  ✅ Auto-reload turned off.")
-
-    def _billing_limit_screen(self, state):
-        """Screen 5 — monthly spend limit (read-only; cap is portal-only)."""
-        from agent.billing_view import format_money
-
-        print()
-        _cprint(f"  💳 {_b('Monthly spend limit')}")
-        print(f"  {'─' * 41}")
-        cap = state.monthly_cap
-        if cap is None or cap.limit_usd is None:
-            _cprint(f"  {_d('No monthly cap visible (managed on the portal).')}")
-        else:
-            spent = format_money(cap.spent_this_month_usd)
-            limit = format_money(cap.limit_usd)
-            ceiling = " (default ceiling)" if cap.is_default_ceiling else ""
-            print(f"  {spent} of {limit} used this month{ceiling}")
-        _limit_note = (
-            "The monthly limit is set on the portal — the terminal shows "
-            "it read-only."
-        )
-        _cprint(f"  {_d(_limit_note)}")
-        self._billing_portal_hint(state)
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""
@@ -9952,6 +9810,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if result.get("success") and result.get("transcript", "").strip():
                 transcript = result["transcript"].strip()
                 self._attached_images.clear()
+                self._attached_image_texts.clear()
                 if hasattr(self, '_app') and self._app:
                     self._app.invalidate()
                 self._pending_input.put(transcript)
@@ -10953,13 +10812,145 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     agent_message = _prepend_note_to_message(agent_message, _srn)
                     self._pending_skills_reload_note = None
                 try:
-                    result = self.agent.run_conversation(
-                        user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
-                        stream_callback=stream_callback,
-                        task_id=self.session_id,
-                        persist_user_message=message if _voice_prefix else None,
-                    )
+                    route_via_claude_code = False
+                    try:
+                        from gateway.orchestrator_modes import MODE_CLARA_LEAD, read_mode
+                        route_via_claude_code = read_mode(get_hermes_home()).get("mode") == MODE_CLARA_LEAD
+                    except Exception:
+                        route_via_claude_code = False
+
+                    if route_via_claude_code:
+                        # clara-lead is not a display-only mode.  In CLI/Wave as
+                        # well as Slack, every normal assistant turn must be
+                        # handled by the official local Claude Code CLI bridge so
+                        # Sangkun's Claude subscription runtime is used instead
+                        # of Hermes' parent OpenAI/Codex provider.
+                        from gateway.claude_code_bridge import (
+                            bridge_config,
+                            run_claude_code_bridge_resident,
+                            run_claude_code_bridge_sync,
+                        )
+
+                        _bridge_config = getattr(self, "config", {}) or {}
+                        _bridge_runner = (
+                            run_claude_code_bridge_resident
+                            if bridge_config(_bridge_config).get("resident_enabled")
+                            else run_claude_code_bridge_sync
+                        )
+
+                        def _bridge_progress_callback(_event_type, text, _data=None):
+                            try:
+                                event_type = str(_event_type or "progress")
+                                data = _data if isinstance(_data, dict) else {}
+
+                                # Claude Agent SDK path: mirror SDK AssistantMessage
+                                # text into Hermes' native streaming box, and map
+                                # structured Claude tool events into normal Hermes
+                                # tool progress. Raw SDK heartbeat lines stay out
+                                # of scrollback so hermes-claude matches
+                                # hermes-codex visually.
+                                if event_type == "clara.assistant.delta":
+                                    self._stream_delta(str(text or ""))
+                                    return
+                                if event_type == "clara.assistant.boundary":
+                                    self._stream_delta(None)
+                                    self._invalidate()
+                                    return
+                                if event_type == "clara.tool.started":
+                                    self._stream_delta(None)
+                                    tool_name = data.get("tool_name") or "claude_tool"
+                                    tool_args = data.get("tool_args") if isinstance(data.get("tool_args"), dict) else {}
+                                    preview = data.get("preview") or str(text or "")
+                                    self._print_claude_tool_progress_line("started", tool_name, tool_args, preview)
+                                    self._on_tool_progress(
+                                        "tool.started",
+                                        tool_name,
+                                        preview,
+                                        tool_args,
+                                    )
+                                    return
+                                if event_type == "clara.tool.completed":
+                                    tool_name = data.get("tool_name") or "claude_tool"
+                                    tool_args = data.get("tool_args") if isinstance(data.get("tool_args"), dict) else {}
+                                    preview = data.get("preview") or str(text or "")
+                                    self._on_tool_progress(
+                                        "tool.completed",
+                                        tool_name,
+                                        preview,
+                                        tool_args,
+                                        result=data.get("result"),
+                                        duration=float(data.get("duration") or 0.0),
+                                    )
+                                    return
+                                if event_type in {"sdk.tool.started", "sdk.tool.completed"}:
+                                    self._spinner_text = f"🟪 {text}"
+                                    self._tool_start_time = 0.0
+                                    self._invalidate()
+                                    return
+                                if event_type in {"sdk.stream_event", "sdk.text_delta", "sdk.thinking", "sdk.message_stop", "sdk.assistant", "sdk.tool.result", "sdk.rate_limit", "sdk.result"}:
+                                    # Low-level SDK heartbeat: useful for the
+                                    # footer, too noisy for scrollback and can
+                                    # land inside an open response box.
+                                    self._spinner_text = f"🟪 {text}"
+                                    self._tool_start_time = 0.0
+                                    self._invalidate()
+                                    return
+
+                                self._spinner_text = f"🟪 {text}"
+                                self._tool_start_time = 0.0
+                                if not getattr(self, "_stream_box_opened", False):
+                                    self._print_claude_bridge_status_line(event_type, str(text or ""), data)
+                                self._invalidate()
+                            except Exception:
+                                pass
+
+                        bridge_result = _bridge_runner(
+                            config=_bridge_config,
+                            message=agent_message,
+                            context_prompt=None,
+                            channel_prompt=None,
+                            history=self.conversation_history[:-1],  # Exclude the message we just added
+                            hermes_home=get_hermes_home(),
+                            bridge_session_key=f"cli:{self.session_id}",
+                            progress_callback=_bridge_progress_callback,
+                        )
+                        bridge_response_previewed = bool(getattr(self, "_stream_started", False))
+                        if bridge_response_previewed:
+                            # Claude Agent SDK deltas bypass the normal
+                            # run_conversation streaming finalizer.  Flush and
+                            # close the Hermes box here before prompt_toolkit
+                            # redraws the prompt; otherwise the shell prompt can
+                            # appear inside an open response box and look
+                            # corrupted/duplicated.
+                            self._stream_delta(None)
+                        previous_history = list(self.conversation_history[:-1])
+                        result = {
+                            "final_response": bridge_result.final_response,
+                            "response_previewed": bridge_response_previewed and bridge_result.exit_code == 0,
+                            "messages": previous_history + [
+                                {"role": "user", "content": message},
+                                {"role": "assistant", "content": bridge_result.final_response},
+                            ],
+                            "api_calls": 0,
+                            "tools": ["claude-code-cli"],
+                            "completed": bridge_result.exit_code == 0,
+                            "failed": bridge_result.exit_code != 0,
+                            "metadata": {
+                                "provider": "claude-code-cli",
+                                "job_id": bridge_result.job_id,
+                                "workdir": bridge_result.workdir,
+                                "log_dir": bridge_result.log_dir,
+                                "exit_code": bridge_result.exit_code,
+                            },
+                        }
+                    else:
+                        result = self.agent.run_conversation(
+                            user_message=agent_message,
+                            conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
+                            stream_callback=stream_callback,
+                            task_id=self.session_id,
+                            persist_user_message=message if _voice_prefix else None,
+                        )
                 except Exception as exc:
                     logging.error("run_conversation raised: %s", exc, exc_info=True)
                     _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
@@ -11829,6 +11820,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Clipboard image attachments (paste images into the CLI)
         self._attached_images: list[Path] = []
+        self._attached_image_texts: list[str] = []
         self._image_counter = 0
 
         # Voice mode state (protected by _voice_lock for cross-thread access)
@@ -11865,7 +11857,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             """
             return None
 
-        def handle_enter(event):
+        _delayed_enter_pending = [False]
+
+        def _handle_enter_now(event):
             """Handle Enter key - submit input.
             
             Routes to the correct queue based on active UI state:
@@ -11953,8 +11947,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             # --- Normal input routing ---
             text = event.app.current_buffer.text.strip()
+            # Terminal drag-and-drop pastes a local file path as plain text.
+            # Detect a dragged/pasted image path here and convert it to a
+            # vision text summary (same workflow as clipboard image paste),
+            # instead of sending the raw path as a chat message. _detect_file_drop
+            # only matches when the leading token resolves to a real existing
+            # file, so slash commands and ordinary prose are unaffected.
+            if text:
+                _drop = _detect_file_drop(text)
+                if _drop is not None and _drop.get("is_image"):
+                    _img_path = _drop["path"]
+                    _remainder = (_drop.get("remainder") or "").strip()
+                    text = self._analyze_image_as_input_text(
+                        _img_path, user_text=_remainder, announce=True
+                    )
+            has_image_texts = bool(getattr(self, "_attached_image_texts", []))
             has_images = bool(self._attached_images)
-            if text or has_images:
+            if text or has_images or has_image_texts:
+                # Natural lead-mode controls (e.g. `현재모드`) are UI commands,
+                # not LLM turns. Handle them before normal LLM routing.
+                if text and not has_images and not has_image_texts and self._handle_natural_lead_mode_text(text):
+                    event.app.current_buffer.reset(append_to_history=True)
+                    return
+
                 # Handle /model directly on the UI thread so interactive pickers
                 # can safely use prompt_toolkit terminal handoff helpers.
                 if self._should_handle_model_command_inline(text, has_images=has_images):
@@ -11990,9 +12005,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     event.app.invalidate()
                     return
 
-                # Snapshot and clear attached images
+                # Snapshot and clear attached image text summaries / images
+                image_texts = list(getattr(self, "_attached_image_texts", []))
+                self._attached_image_texts.clear()
+                if image_texts:
+                    prefix = "\n\n".join(part for part in image_texts if part)
+                    text = f"{prefix}\n\n{text}" if text else prefix
                 images = list(self._attached_images)
                 self._attached_images.clear()
+                self._attached_image_texts.clear()
                 event.app.invalidate()
                 # Bundle text + images as a tuple when images are present
                 payload = (text, images) if images else text
@@ -12055,6 +12076,40 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 else:
                     self._pending_input.put(payload)
                 event.app.current_buffer.reset(append_to_history=True)
+
+        def handle_enter(event):
+            """Submit on Enter, with a tiny Wave/macOS Korean IME composition defer."""
+            modal_active = any(
+                (
+                    self._sudo_state,
+                    self._secret_state,
+                    self._approval_state,
+                    self._slash_confirm_state,
+                    self._model_picker_state,
+                    self._clarify_state,
+                )
+            )
+            if _wave_korean_enter_delay_enabled() and not modal_active:
+                if _delayed_enter_pending[0]:
+                    return
+                _delayed_enter_pending[0] = True
+
+                def _run_delayed_submit():
+                    _delayed_enter_pending[0] = False
+                    _handle_enter_now(event)
+                    try:
+                        event.app.invalidate()
+                    except Exception:
+                        pass
+
+                try:
+                    event.app.loop.call_later(_wave_korean_enter_delay_seconds(), _run_delayed_submit)
+                except Exception:
+                    _delayed_enter_pending[0] = False
+                    _handle_enter_now(event)
+                return
+
+            _handle_enter_now(event)
 
         _bind_prompt_submit_keys(kb, handle_enter)
         
@@ -12264,15 +12319,83 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             lambda: not self._clarify_state and not self._approval_state and not self._slash_confirm_state and not self._sudo_state and not self._secret_state and not self._model_picker_state
         )
 
-        @kb.add('up', filter=_normal_input)
-        def history_up(event):
-            """Up arrow: browse history when on first line, else move cursor up."""
-            event.app.current_buffer.auto_up(count=event.arg)
+        def _move_cursor_left(event):
+            event.app.current_buffer.cursor_left(count=event.arg)
 
-        @kb.add('down', filter=_normal_input)
-        def history_down(event):
-            """Down arrow: browse history when on last line, else move cursor down."""
-            event.app.current_buffer.auto_down(count=event.arg)
+        def _move_cursor_right(event):
+            event.app.current_buffer.cursor_right(count=event.arg)
+
+        def _move_cursor_or_history_up(event):
+            buf = event.app.current_buffer
+            before = buf.cursor_position
+            buf.cursor_up(count=event.arg)
+            if buf.cursor_position == before:
+                buf.auto_up(count=event.arg)
+
+        def _move_cursor_or_history_down(event):
+            buf = event.app.current_buffer
+            before = buf.cursor_position
+            buf.cursor_down(count=event.arg)
+            if buf.cursor_position == before:
+                buf.auto_down(count=event.arg)
+
+        # VS Code/Parsec/remote-desktop stacks sometimes deliver a physical
+        # no-modifier arrow as a modified prompt_toolkit key (ShiftLeft,
+        # ControlLeft, etc.) even when the user only pressed Left.  In Hermes'
+        # normal composer, cursor movement is more important than preserving
+        # modifier semantics, so all arrow variants fall back to the same
+        # predictable character movement/history behavior.
+        @kb.add('left', filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ShiftLeft, filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ControlLeft, filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ControlShiftLeft, filter=_normal_input, eager=True)
+        @kb.add('escape', 'left', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', 'D', filter=_normal_input, eager=True)
+        @kb.add('escape', 'O', 'D', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', '1', 'D', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', '1', ';', '1', 'D', filter=_normal_input, eager=True)
+        def cursor_left(event):
+            """Left arrow: move cursor left in the input buffer."""
+            _move_cursor_left(event)
+
+        @kb.add('right', filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ShiftRight, filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ControlRight, filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ControlShiftRight, filter=_normal_input, eager=True)
+        @kb.add('escape', 'right', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', 'C', filter=_normal_input, eager=True)
+        @kb.add('escape', 'O', 'C', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', '1', 'C', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', '1', ';', '1', 'C', filter=_normal_input, eager=True)
+        def cursor_right(event):
+            """Right arrow: move cursor right in the input buffer."""
+            _move_cursor_right(event)
+
+        @kb.add('up', filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ShiftUp, filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ControlUp, filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ControlShiftUp, filter=_normal_input, eager=True)
+        @kb.add('escape', 'up', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', 'A', filter=_normal_input, eager=True)
+        @kb.add('escape', 'O', 'A', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', '1', 'A', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', '1', ';', '1', 'A', filter=_normal_input, eager=True)
+        def cursor_or_history_up(event):
+            """Up arrow: move within multiline draft; history only from first line."""
+            _move_cursor_or_history_up(event)
+
+        @kb.add('down', filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ShiftDown, filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ControlDown, filter=_normal_input, eager=True)
+        @kb.add(_IgnoreKeys.ControlShiftDown, filter=_normal_input, eager=True)
+        @kb.add('escape', 'down', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', 'B', filter=_normal_input, eager=True)
+        @kb.add('escape', 'O', 'B', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', '1', 'B', filter=_normal_input, eager=True)
+        @kb.add('escape', '[', '1', ';', '1', 'B', filter=_normal_input, eager=True)
+        def cursor_or_history_down(event):
+            """Down arrow: move within multiline draft; history only from last line."""
+            _move_cursor_or_history_down(event)
 
         @kb.add('c-l')
         def handle_ctrl_l(event):
@@ -12374,9 +12497,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self.agent.interrupt()
             # If there's text or images, clear them (like bash).
             # If everything is already empty, exit.
-            elif event.app.current_buffer.text or self._attached_images:
+            elif event.app.current_buffer.text or self._attached_images or getattr(self, "_attached_image_texts", []):
                 event.app.current_buffer.reset()
                 self._attached_images.clear()
+                self._attached_image_texts.clear()
                 event.app.invalidate()
             else:
                 self._should_exit = True
@@ -12465,9 +12589,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if self._agent_running and self.agent:
                 print("\n⚡ Interrupting agent...")
                 self.agent.interrupt()
-            elif event.app.current_buffer.text or self._attached_images:
+            elif event.app.current_buffer.text or self._attached_images or getattr(self, "_attached_image_texts", []):
                 event.app.current_buffer.reset()
                 self._attached_images.clear()
+                self._attached_image_texts.clear()
                 event.app.invalidate()
             else:
                 self._should_exit = True
@@ -12698,29 +12823,55 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         @kb.add('c-v')
         def handle_ctrl_v(event):
-            """Fallback image paste for terminals without bracketed paste.
+            """Ctrl+V fallback: paste text only, never auto-attach images.
 
-            On Linux terminals (GNOME Terminal, Konsole, etc.), Ctrl+V
-            sends raw byte 0x16 instead of triggering a paste.  This
-            binding catches that and checks the clipboard for images.
-            On terminals that DO intercept Ctrl+V for paste (macOS
-            Terminal, iTerm2, VSCode, Windows Terminal), the bracketed
-            paste handler fires instead and this binding never triggers.
+            In VS Code integrated terminal with Windows-style key mappings,
+            Ctrl+V can reach Hermes as raw ``c-v``.  Previously this binding
+            treated that as an image-paste shortcut and attached any screenshot
+            currently in the macOS clipboard.  That is surprising for normal
+            terminal paste: Ctrl+V should not turn clipboard images into chat
+            attachments.  Explicit image attach remains available via Alt+V,
+            ``/paste``, or ``/image <path>``.
             """
-            if self._try_attach_clipboard_image():
+            pasted_text = ""
+            try:
+                if sys.platform == "darwin":
+                    info = subprocess.run(
+                        ["osascript", "-e", "clipboard info"],
+                        capture_output=True,
+                        text=True,
+                        timeout=1,
+                    )
+                    has_text_clipboard = (
+                        info.returncode == 0
+                        and any(marker in info.stdout for marker in ("string", "Unicode text", "«class utf8»", "«class ut16»"))
+                    )
+                    if has_text_clipboard:
+                        cp = subprocess.run(
+                            ["pbpaste"],
+                            capture_output=True,
+                            text=True,
+                            timeout=1,
+                        )
+                        if cp.returncode == 0:
+                            pasted_text = cp.stdout or ""
+            except Exception:
+                pasted_text = ""
+            if pasted_text:
+                pasted_text = pasted_text.replace('\r\n', '\n').replace('\r', '\n')
+                pasted_text = _strip_leaked_bracketed_paste_wrappers(pasted_text)
+                event.current_buffer.insert_text(pasted_text)
                 event.app.invalidate()
 
         @kb.add('escape', 'v')
         def handle_alt_v(event):
-            """Alt+V — paste image from clipboard.
+            """Alt+V — paste clipboard image as summarized text.
 
-            Alt key combos pass through all terminal emulators (sent as
-            ESC + key), unlike Ctrl+V which terminals intercept for text
-            paste.  This is the reliable way to attach clipboard images
-            on WSL2, VSCode, and any terminal over SSH where Ctrl+V
-            can't reach the application for image-only clipboard.
+            This is an explicit Hermes shortcut only. Normal VS Code terminal
+            drag/drop should stay simple: VS Code inserts a file path, then
+            Hermes summarizes that path on submit.
             """
-            if self._try_attach_clipboard_image():
+            if self._try_insert_clipboard_image_text(event.current_buffer):
                 event.app.invalidate()
             else:
                 # No image found — show a hint
@@ -12735,7 +12886,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Create the input area with multiline (Alt+Enter), autocomplete, and paste handling
         from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-        from prompt_toolkit.completion import ThreadedCompleter
 
 
         _completer = SlashCommandCompleter(
@@ -12751,13 +12901,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             wrap_lines=True,
             read_only=Condition(lambda: bool(cli_ref._command_running)),
             history=FileHistory(str(self._history_file)),
-            # complete_while_typing fires the completer on every keystroke. The
-            # completer does blocking work — fuzzy @-file indexing shells out to
-            # rg/fd (up to a 2s timeout) and path completion hits os.listdir/stat
-            # — so running it inline would stall the render loop on each key (very
-            # noticeable on WSL2/slow filesystems). ThreadedCompleter moves it off
-            # the UI event loop, keeping typing responsive.
-            completer=ThreadedCompleter(_completer),
+            completer=_completer,
             complete_while_typing=True,
             auto_suggest=SlashCommandAutoSuggest(
                 history_suggest=AutoSuggestFromHistory(),
@@ -12775,17 +12919,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         def _input_height():
             try:
                 from prompt_toolkit.application import get_app
+                from prompt_toolkit.utils import get_cwidth
 
                 doc = input_area.buffer.document
+                prompt_width = max(2, get_cwidth(self._get_tui_prompt_text()))
                 try:
-                    terminal_columns = get_app().output.get_size().columns
+                    available_width = get_app().output.get_size().columns - prompt_width
                 except Exception:
-                    terminal_columns = shutil.get_terminal_size((80, 24)).columns
-                return _estimate_tui_input_height(
-                    doc.lines,
-                    self._get_tui_prompt_text(),
-                    terminal_columns,
-                )
+                    available_width = shutil.get_terminal_size((80, 24)).columns - prompt_width
+                if available_width < 10:
+                    available_width = 40
+                visual_lines = 0
+                for line in doc.lines:
+                    # Each logical line takes at least 1 visual row; long lines wrap.
+                    # Use prompt_toolkit's cell width so CJK wide characters count as 2.
+                    line_width = get_cwidth(line)
+                    if line_width <= 0:
+                        visual_lines += 1
+                    else:
+                        visual_lines += max(1, -(-line_width // available_width))  # ceil division
+                return min(max(visual_lines, 1), 8)
             except Exception:
                 return 1
 
@@ -13387,17 +13540,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         cli_ref = self
 
         def _get_image_bar():
-            if not cli_ref._attached_images:
+            # Sangkun's VS Code terminal workflow expects screenshot/image drops
+            # to appear as ordinary path text in the active Hermes input line,
+            # never as a separate attachment badge/chip.  Some terminal stacks
+            # still route image paste/drop into ``_attached_images`` before the
+            # keybinding layer sees text; convert that state back into buffer
+            # text during rendering and suppress the badge row.
+            if cli_ref._attached_images:
+                try:
+                    buf = input_area.buffer
+                    existing = buf.text or ""
+                    parts = []
+                    for image_path in cli_ref._attached_images:
+                        token = shlex.quote(str(image_path))
+                        if token not in existing:
+                            parts.append(token)
+                    cli_ref._attached_images.clear()
+                    if parts:
+                        prefix = ""
+                        if existing and buf.cursor_position > 0 and existing[buf.cursor_position - 1] not in {"\n", " "}:
+                            prefix = "\n"
+                        buf.insert_text(prefix + " ".join(parts))
+                except Exception:
+                    cli_ref._attached_images.clear()
                 return []
-            badges = _format_image_attachment_badges(
-                cli_ref._attached_images,
-                cli_ref._image_counter,
-            )
-            return [("class:image-badge", f" {badges} ")]
+            text_count = len(getattr(cli_ref, "_attached_image_texts", []))
+            if text_count:
+                try:
+                    buf = input_area.buffer
+                    existing = buf.text or ""
+                    text_parts = [part for part in getattr(cli_ref, "_attached_image_texts", []) if part]
+                    cli_ref._attached_image_texts.clear()
+                    if text_parts:
+                        prefix = ""
+                        if existing and buf.cursor_position > 0 and existing[buf.cursor_position - 1] not in {"\n", " "}:
+                            prefix = "\n"
+                        buf.insert_text(prefix + "\n\n".join(text_parts))
+                except Exception:
+                    cli_ref._attached_image_texts.clear()
+                return []
+            return []
 
         image_bar = Window(
             content=FormattedTextControl(_get_image_bar),
-            height=Condition(lambda: bool(cli_ref._attached_images)),
+            height=Condition(lambda: bool(cli_ref._attached_images) or bool(getattr(cli_ref, "_attached_image_texts", []))),
         )
 
         # Persistent voice mode status bar (visible only when voice mode is on)
@@ -13527,13 +13713,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             style=style,
             full_screen=False,
             mouse_support=False,
-            # The status bar contains wall-clock read-outs (live prompt elapsed
-            # and idle-since-last-turn). Once a turn finishes there may be no
-            # further events to invalidate the app, so prompt_toolkit would keep
-            # rendering the first post-turn value (usually ``✓ 0s``) forever.
-            # A low-rate refresh keeps the clock honest without reintroducing a
-            # custom repaint thread or touching conversation state.
-            refresh_interval=1.0,
             # Erase the live bottom chrome (status bar, input box, separator
             # rules) on exit instead of freezing a final copy into scrollback.
             # Without this, prompt_toolkit's render_as_done teardown repaints
@@ -13691,9 +13870,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         _drop_path = _file_drop["path"]
                         _remainder = _file_drop["remainder"]
                         if _file_drop["is_image"]:
-                            submit_images.append(_drop_path)
-                            user_input = _remainder or f"[User attached image: {_drop_path.name}]"
-                            _cprint(f"  📎 Auto-attached image: {_drop_path.name}")
+                            # VS Code file drops / pasted image paths should become
+                            # text context for Sangkun's terminal workflow, not native
+                            # image attachments.  Analyze once and send the summary
+                            # text to the agent; keep the image path in that text for
+                            # optional follow-up via vision_analyze.
+                            user_input = self._analyze_image_as_input_text(
+                                _drop_path,
+                                user_text=_remainder,
+                                announce=True,
+                            )
+                            _file_drop = None
                         else:
                             _cprint(f"  📄 Detected file: {_drop_path.name}")
                             user_input = (
@@ -14472,7 +14659,9 @@ def main(
     
     # Handle single query mode
     if query or image:
+
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
+
             sys.exit(1)
         try:
             query, single_query_images = _collect_query_images(query, image)
@@ -14589,10 +14778,59 @@ def main(
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
                         try:
-                            result = cli.agent.run_conversation(
-                                user_message=effective_query,
-                                conversation_history=cli.conversation_history,
-                            )
+                            route_via_claude_code = False
+                            try:
+                                from gateway.orchestrator_modes import MODE_CLARA_LEAD, read_mode
+                                route_via_claude_code = read_mode(get_hermes_home()).get("mode") == MODE_CLARA_LEAD
+                            except Exception:
+                                route_via_claude_code = False
+
+                            if route_via_claude_code:
+                                from gateway.claude_code_bridge import (
+                                    bridge_config,
+                                    run_claude_code_bridge_resident,
+                                    run_claude_code_bridge_sync,
+                                )
+
+                                _bridge_config = getattr(cli, "config", {}) or {}
+                                _bridge_runner = (
+                                    run_claude_code_bridge_resident
+                                    if bridge_config(_bridge_config).get("resident_enabled")
+                                    else run_claude_code_bridge_sync
+                                )
+
+                                bridge_result = _bridge_runner(
+                                    config=_bridge_config,
+                                    message=effective_query if isinstance(effective_query, str) else str(effective_query),
+                                    context_prompt=None,
+                                    channel_prompt=None,
+                                    history=cli.conversation_history,
+                                    hermes_home=get_hermes_home(),
+                                    bridge_session_key=f"cli:{cli.session_id}",
+                                )
+                                result = {
+                                    "final_response": bridge_result.final_response,
+                                    "messages": list(cli.conversation_history) + [
+                                        {"role": "user", "content": effective_query},
+                                        {"role": "assistant", "content": bridge_result.final_response},
+                                    ],
+                                    "api_calls": 0,
+                                    "tools": ["claude-code-cli"],
+                                    "completed": bridge_result.exit_code == 0,
+                                    "failed": bridge_result.exit_code != 0,
+                                    "metadata": {
+                                        "provider": "claude-code-cli",
+                                        "job_id": bridge_result.job_id,
+                                        "workdir": bridge_result.workdir,
+                                        "log_dir": bridge_result.log_dir,
+                                        "exit_code": bridge_result.exit_code,
+                                    },
+                                }
+                            else:
+                                result = cli.agent.run_conversation(
+                                    user_message=effective_query,
+                                    conversation_history=cli.conversation_history,
+                                )
                         except KeyboardInterrupt:
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
