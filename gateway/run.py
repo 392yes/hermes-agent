@@ -8912,7 +8912,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
-            if not os.getenv(env_key):
+            configured_home = self.config.get_home_channel(source.platform)
+            if not os.getenv(env_key) and not (configured_home and configured_home.chat_id):
                 # Slack dispatches all Hermes commands through a single
                 # parent slash command `/hermes`; bare `/sethome` is not
                 # registered and would fail with "app did not respond".
@@ -13775,6 +13776,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return self._is_session_run_current(session_key, run_generation)
         
         user_config = _load_gateway_config()
+
+        # Clara/reviewer can be configured to use the local Claude Code CLI
+        # subscription bridge instead of a normal Hermes model provider.  The
+        # bridge provider name (``claude-code-cli``) is intentionally not a
+        # LiteLLM/API provider, so route it here before AIAgent tries normal
+        # provider resolution and reports "Unknown provider" to Slack.
+        try:
+            from gateway.claude_code_bridge import (
+                bridge_config,
+                is_claude_code_cli_config,
+                run_claude_code_bridge_resident,
+                run_claude_code_bridge_sync,
+            )
+
+            if is_claude_code_cli_config(user_config):
+                _bridge_runner = (
+                    run_claude_code_bridge_resident
+                    if bridge_config(user_config).get("resident_enabled")
+                    else run_claude_code_bridge_sync
+                )
+                _bridge_result = await asyncio.to_thread(
+                    _bridge_runner,
+                    config=user_config,
+                    message=message,
+                    context_prompt=context_prompt,
+                    channel_prompt=channel_prompt,
+                    history=history,
+                    hermes_home=get_hermes_home(),
+                    bridge_session_key=session_key,
+                )
+                return {
+                    "final_response": _bridge_result.final_response,
+                    "messages": [],
+                    "api_calls": 0,
+                    "completed": _bridge_result.exit_code == 0,
+                    "session_id": session_id,
+                    "clara_bridge": {
+                        "job_id": _bridge_result.job_id,
+                        "workdir": _bridge_result.workdir,
+                        "log_dir": _bridge_result.log_dir,
+                        "exit_code": _bridge_result.exit_code,
+                    },
+                }
+        except Exception as _bridge_exc:
+            logger.exception("Claude Code CLI bridge failed before normal agent fallback")
+            return {
+                "final_response": (
+                    "⚠️ Clara Claude Code CLI bridge failed before the normal agent path.\n"
+                    f"오류: {_bridge_exc}"
+                ),
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "session_id": session_id,
+            }
+
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
