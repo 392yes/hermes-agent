@@ -313,12 +313,39 @@ class CLICommandsMixin:
         from hermes_cli.clipboard import has_clipboard_image
         if has_clipboard_image():
             if self._try_attach_clipboard_image():
+                if self._image_attachments_text_only():
+                    img_path = self._attached_images.pop()
+                    analysis = self._preprocess_images_with_vision("", [img_path])
+                    self._attached_image_texts.append(analysis)
+                    _cprint("  ✓ Clipboard image converted to text analysis")
+                    return
                 n = len(self._attached_images)
                 _cprint(f"  📎 Image #{n} attached from clipboard")
             else:
                 _cprint(f"  {_DIM}(>_<) Clipboard has an image but extraction failed{_RST}")
         else:
             _cprint(f"  {_DIM}(._.) No image found in clipboard{_RST}")
+
+    def _image_attachments_text_only(self) -> bool:
+        """Return True when image attachment UX should avoid pending pixels.
+
+        In ``agent.image_input_mode: text`` the user expects screenshots to be
+        converted into textual vision summaries instead of staying in the CLI as
+        pending image attachments. Keep the check config-driven so switching
+        back to ``auto``/``native`` restores the original attach flow.
+        """
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            return (
+                str((cfg.get("agent") or {}).get("image_input_mode") or "auto")
+                .strip()
+                .lower()
+                == "text"
+            )
+        except Exception:
+            return False
 
     def _handle_copy_command(self, cmd_original: str) -> None:
         """Handle /copy [number] — copy assistant output to clipboard."""
@@ -375,6 +402,12 @@ class CLICommandsMixin:
             return
         if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
             _cprint(f"  {_DIM}(._.) Not a supported image file: {image_path.name}{_RST}")
+            return
+
+        if self._image_attachments_text_only():
+            analysis = self._preprocess_images_with_vision(_remainder or "", [image_path])
+            self._attached_image_texts.append(analysis)
+            _cprint(f"  ✓ Converted image to text analysis: {image_path.name}")
             return
 
         self._attached_images.append(image_path)
@@ -1038,6 +1071,83 @@ class CLICommandsMixin:
             print()
             print("  Usage: /personality <name>")
             print()
+
+    def _handle_model_swap_command(self, cmd: str):
+        """Handle /model-swap: switch the Clara bridge model mid-session.
+
+        Only meaningful in clara-lead mode (HERMES_LEAD_MODE=clara-lead), where
+        turns route through the Claude Code bridge. Writes a runtime override
+        that the bridge reads on the next turn and evicts the resident pool so
+        the next turn respawns with the new --model. Conversation context is
+        preserved by the bridge's normal per-turn history re-injection, so no
+        manual /session-handoff or /session-resume is required.
+        """
+        import os
+        from gateway.claude_code_bridge import (
+            read_clara_model_override,
+            write_clara_model_override,
+            resolve_clara_model_alias,
+            clara_model_override_path,
+        )
+
+        parts = cmd.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        def _evict_pool() -> None:
+            try:
+                from gateway.claude_resident import get_pool
+                get_pool().shutdown_all()
+            except Exception:
+                # No warm pool yet (or import unavailable) — the next turn will
+                # simply spawn cold with the new model. Non-fatal.
+                pass
+
+        def _effective_line() -> str:
+            override = read_clara_model_override()
+            env_model = os.environ.get("ANTHROPIC_MODEL", "").strip()
+            if override:
+                return f"현재: {override}  (source: /model-swap override)"
+            if env_model:
+                return f"현재: {env_model}  (source: ANTHROPIC_MODEL env)"
+            return "현재: claude-opus-4-8  (source: settings.json default)"
+
+        lead_mode = os.environ.get("HERMES_LEAD_MODE", "").strip()
+        if lead_mode != "clara-lead":
+            print("(._.) /model-swap 는 clara-lead 모드에서만 동작합니다.")
+            print(f"  현재 HERMES_LEAD_MODE={lead_mode or '(unset)'} — hermes-claude 로 시작하세요.")
+            return
+
+        # Status / no-arg → show current state.
+        if not arg or arg.lower() == "status":
+            print()
+            print("+" + "-" * 52 + "+")
+            print("|" + "  (^o^)/ Clara model-swap".ljust(52) + "|")
+            print("+" + "-" * 52 + "+")
+            print(f"  {_effective_line()}")
+            print(f"  override file: {clara_model_override_path()}")
+            print("  Usage: /model-swap <opus|fable|off>")
+            print("         /model-swap <full-model-id>")
+            print()
+            return
+
+        # Clear override → back to env/config default.
+        if arg.lower() in {"off", "default", "none", "env", "clear"}:
+            write_clara_model_override("")
+            _evict_pool()
+            print("(^_^)b model-swap override 해제됨 — 다음 턴부터 env/config 기본 모델로 복귀.")
+            print(f"  {_effective_line()}")
+            return
+
+        # Set override. Capture the effective model BEFORE the swap so the next
+        # turn can emit an auto-handoff banner (from_model -> target) and the new
+        # model continues the conversation seamlessly.
+        prev_model = read_clara_model_override() or os.environ.get("ANTHROPIC_MODEL", "").strip() or "claude-opus-4-8"
+        target = resolve_clara_model_alias(arg)
+        write_clara_model_override(target, from_model=prev_model)
+        _evict_pool()
+        print(f"(^_^)b Clara 모델 전환: {prev_model} -> {target}")
+        print("  다음 턴부터 이 pane에서 새 모델로 응답합니다. (대화 맥락 자동 인계)")
+        print(f"  override file: {clara_model_override_path()}")
 
     def _handle_cron_command(self, cmd: str):
         """Handle the /cron command to manage scheduled tasks."""
