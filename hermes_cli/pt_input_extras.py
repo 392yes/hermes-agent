@@ -83,6 +83,41 @@ def install_ctrl_enter_alias() -> int:
     return changed
 
 
+def install_arrow_key_aliases() -> int:
+    """Map extended no-modifier arrow sequences to normal arrow keys.
+
+    Some terminal stacks (notably VS Code integrated terminal through shells or
+    multiplexers) can emit xterm/CSI-u style no-modifier arrows such as
+    ``ESC [ 1 ; 1 D`` instead of the shorter ``ESC [ D`` sequence that
+    prompt_toolkit maps by default.  If unmapped, the bytes are effectively
+    swallowed or inserted as noise and the cursor appears not to move.
+
+    Returns the number of sequences whose mapping was changed.
+    """
+    try:
+        from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+        from prompt_toolkit.keys import Keys
+    except Exception:
+        return 0
+
+    mappings = {
+        "\x1b[1;1A": Keys.Up,
+        "\x1b[1;1B": Keys.Down,
+        "\x1b[1;1C": Keys.Right,
+        "\x1b[1;1D": Keys.Left,
+        "\x1b[1A": Keys.Up,
+        "\x1b[1B": Keys.Down,
+        "\x1b[1C": Keys.Right,
+        "\x1b[1D": Keys.Left,
+    }
+    changed = 0
+    for seq, key in mappings.items():
+        if ANSI_SEQUENCES.get(seq) != key:
+            ANSI_SEQUENCES[seq] = key
+            changed += 1
+    return changed
+
+
 def install_ignored_terminal_sequences() -> int:
     """Map terminal-emitted noise sequences to ``Keys.Ignore`` so they
     are consumed by the VT100 parser before they reach key bindings or
