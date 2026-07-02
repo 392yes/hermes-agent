@@ -13,6 +13,7 @@ Code CLI resident bridge.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import time
 from collections.abc import Callable
@@ -22,6 +23,31 @@ from typing import Any, Iterable
 
 class ClaudeAgentSDKBridgeError(RuntimeError):
     """Raised when the SDK bridge cannot run a turn."""
+
+
+def _enforce_sdk_default_max_buffer_size(max_buffer_size: int | None) -> None:
+    """Raise the SDK transport's fallback stdout JSON buffer limit.
+
+    ``ClaudeAgentOptions.max_buffer_size`` is the normal path, but some SDK/CLI
+    combinations have still surfaced the transport's built-in 1 MiB default in
+    production errors.  Patch only the SDK's module-level default upward so even
+    an option propagation miss keeps Clara from aborting on large tool-result
+    JSON messages (screenshots, long file reads, etc.).
+    """
+
+    if not max_buffer_size or max_buffer_size <= 0:
+        return
+    try:
+        transport = importlib.import_module(
+            "claude_agent_sdk._internal.transport.subprocess_cli"
+        )
+        current = int(getattr(transport, "_DEFAULT_MAX_BUFFER_SIZE", 0) or 0)
+        if current < max_buffer_size:
+            setattr(transport, "_DEFAULT_MAX_BUFFER_SIZE", int(max_buffer_size))
+    except Exception:
+        # Best-effort hardening only; the explicit ClaudeAgentOptions field
+        # below remains the authoritative configuration path.
+        return
 
 
 def _split_tool_csv(value: Any) -> list[str]:
@@ -149,11 +175,12 @@ def _jsonable_event(message: Any, *, elapsed: float) -> dict[str, Any]:
         # Keep the structured repr in the job log; final user output never shows
         # this raw blob.  It is useful for confirming subscription path status.
         event["rate_limit"] = repr(message)
-    elif type(message).__name__ == "ResultMessage":
+    elif type(message).__name__.endswith("ResultMessage"):
         for attr in (
             "duration_ms",
             "duration_api_ms",
             "is_error",
+            "api_error_status",
             "num_turns",
             "total_cost_usd",
             "usage",
@@ -260,6 +287,8 @@ async def _run_sdk_turn_async(
     include_partial_messages: bool,
     include_hook_events: bool,
     resume_session_id: str | None,
+    max_buffer_size: int | None,
+    strict_mcp_config: bool,
     log_dir: Path,
     progress_callback: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
@@ -269,6 +298,8 @@ async def _run_sdk_turn_async(
         raise ClaudeAgentSDKBridgeError(
             "claude-agent-sdk package is not installed in the active Hermes venv"
         ) from exc
+
+    _enforce_sdk_default_max_buffer_size(max_buffer_size)
 
     tools: Any
     normalized_tools = str(tools_mode or "claude_code").strip().casefold()
@@ -287,11 +318,14 @@ async def _run_sdk_turn_async(
         "include_partial_messages": include_partial_messages,
         "include_hook_events": include_hook_events,
         "mcp_servers": {},
+        "strict_mcp_config": strict_mcp_config,
         "skills": [],
         "plugins": [],
         "tools": tools,
         "setting_sources": setting_sources,
     }
+    if max_buffer_size:
+        opts_kwargs["max_buffer_size"] = max_buffer_size
     if allowed_tools:
         opts_kwargs["allowed_tools"] = allowed_tools
     if model:
@@ -337,6 +371,26 @@ async def _run_sdk_turn_async(
             sid = getattr(message, "session_id", None)
             if sid:
                 session_id = str(sid)
+
+            # The Agent SDK can deliver user-visible assistant text as raw
+            # StreamEvent ``text_delta`` chunks several seconds before the
+            # corresponding cumulative AssistantMessage arrives.  Mirror those
+            # chunks directly into Hermes' native response box so hermes-claude
+            # has the same live-text feel as hermes-codex, then advance
+            # ``streamed_text`` so the later AssistantMessage snapshot does not
+            # duplicate the already-rendered content.
+            if typ == "StreamEvent":
+                raw_event = getattr(message, "event", None)
+                stream_event_type = str(_get_event_value(raw_event, "type") or "")
+                if stream_event_type == "message_start":
+                    streamed_text = ""
+                delta_type = str(_get_event_value(raw_event, "delta", "type") or "")
+                delta_text = _get_event_value(raw_event, "delta", "text")
+                if delta_type == "text_delta" and delta_text:
+                    text_delta = str(delta_text)
+                    _emit_progress(progress_callback, "clara.assistant.delta", text_delta, event)
+                    streamed_text += text_delta
+
             if typ == "AssistantMessage":
                 latest_model = str(getattr(message, "model", "") or "") or latest_model
                 latest_usage = getattr(message, "usage", None) or latest_usage
@@ -375,18 +429,31 @@ async def _run_sdk_turn_async(
                             preview,
                             {**event, "tool_name": hermes_tool, "tool_id": tool_id, "tool_args": tool_args, "preview": preview, "result": result},
                         )
-            elif typ == "ResultMessage":
+            elif typ.endswith("ResultMessage"):
                 result_event = event
 
-    await asyncio.wait_for(_consume(), timeout=max(1, timeout))
+    sdk_exception: Exception | None = None
+    try:
+        await asyncio.wait_for(_consume(), timeout=max(1, timeout))
+    except Exception as exc:
+        # Preserve the partial SDK stream even when Claude Code aborts.  Recent
+        # Claude Code / Agent SDK versions can yield a ResultMessage with
+        # ``is_error=True`` (for example auth 401) and then raise
+        # "Claude Code returned an error result: success" because the raw
+        # stream-json result still says ``subtype=success``.  If we already have
+        # the structured ResultMessage, render it as the real Claude failure
+        # instead of replacing it with a misleading SDK transport failure.
+        sdk_exception = exc
     (log_dir / "sdk-events.jsonl").write_text(
         "".join(json.dumps(ev, ensure_ascii=False, default=str) + "\n" for ev in events),
         encoding="utf-8",
     )
+    if sdk_exception is not None and result_event is None:
+        raise sdk_exception
     if result_event is None:
         raise ClaudeAgentSDKBridgeError("Claude Agent SDK completed without ResultMessage")
     is_error = bool(result_event.get("is_error")) or str(result_event.get("subtype") or "success") != "success"
-    return {
+    result: dict[str, Any] = {
         "type": "result",
         "subtype": "error" if is_error else "success",
         "is_error": is_error,
@@ -402,6 +469,12 @@ async def _run_sdk_turn_async(
         "event_counts": counts,
         "delivery": "agent-sdk",
     }
+    api_error_status = result_event.get("api_error_status")
+    if api_error_status is not None:
+        result["api_error_status"] = api_error_status
+    if sdk_exception is not None:
+        result["sdk_exception"] = f"{type(sdk_exception).__name__}: {sdk_exception}"
+    return result
 
 
 def run_sdk_turn(
@@ -420,6 +493,8 @@ def run_sdk_turn(
     include_partial_messages: bool = True,
     include_hook_events: bool = False,
     resume_session_id: str | None = None,
+    max_buffer_size: int | None = 8 * 1024 * 1024,
+    strict_mcp_config: bool = False,
     log_dir: Path,
     progress_callback: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
@@ -442,6 +517,8 @@ def run_sdk_turn(
                 include_partial_messages=include_partial_messages,
                 include_hook_events=include_hook_events,
                 resume_session_id=resume_session_id,
+                max_buffer_size=max_buffer_size,
+                strict_mcp_config=strict_mcp_config,
                 log_dir=log_dir,
                 progress_callback=progress_callback,
             )

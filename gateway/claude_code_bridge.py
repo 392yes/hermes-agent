@@ -70,6 +70,13 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().casefold() in {"1", "true", "yes", "on", "enabled"}
 
 
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _split_allowed_tools(value: Any) -> list[str]:
     if value is None:
         return []
@@ -137,6 +144,116 @@ def is_claude_code_cli_config(config: dict[str, Any] | None) -> bool:
     return isinstance(bridge_cfg, dict) and bool(bridge_cfg.get("enabled"))
 
 
+# ---------------------------------------------------------------------------
+# Runtime model override (/model-swap)
+# ---------------------------------------------------------------------------
+# The `/model-swap` slash command lets a single interactive pane switch the
+# Clara bridge model (e.g. opus <-> fable) mid-session without restarting the
+# launcher. It writes a small JSON file that this module reads on every turn
+# and overlays onto the merged bridge config, so the resolved `--model` wins
+# over both config.yaml (clara_cli.model) and the inherited ANTHROPIC_MODEL env.
+# Continuity is preserved by the normal per-turn history re-injection; the
+# swap handler evicts the resident pool so the next turn respawns cold with
+# the new model.
+
+# Friendly aliases -> concrete Claude model ids.
+CLARA_MODEL_ALIASES: dict[str, str] = {
+    "opus": "claude-opus-4-8",
+    "opus-4.8": "claude-opus-4-8",
+    "fable": "claude-fable-5",
+    "fable-5": "claude-fable-5",
+}
+
+
+def clara_model_override_path() -> str:
+    """Path of the runtime model-override file for the Clara bridge."""
+    base = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return os.path.join(base, "runtime", "clara-model-override.json")
+
+
+def read_clara_model_override_meta() -> dict[str, Any]:
+    """Return the full runtime model-override record, or {} when none is set."""
+    try:
+        with open(clara_model_override_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def read_clara_model_override() -> str:
+    """Return the current runtime model override, or '' when none is set."""
+    return str(read_clara_model_override_meta().get("model") or "").strip()
+
+
+def write_clara_model_override(model: str, from_model: str | None = None) -> None:
+    """Persist the runtime model override. Empty model clears the override.
+
+    ``from_model`` records the effective model that was active immediately
+    before the swap so the next turn can emit an auto-handoff banner telling
+    the freshly-spawned model to treat the re-injected history as its own
+    continuous context (no manual /session-handoff required).
+    """
+    path = clara_model_override_path()
+    normalized = str(model or "").strip()
+    if not normalized:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    record: dict[str, Any] = {"model": normalized, "swapped_at": time.time()}
+    prior = str(from_model or "").strip()
+    if prior and prior != normalized:
+        record["from_model"] = prior
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(record, fh, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def clara_handoff_pending() -> bool:
+    """True when a /model-swap override is active but its one-shot 100% handoff
+    has not yet been performed.
+
+    The one-shot handoff force-resumes the previous model's native Claude Code
+    session under the new model on the first turn after a swap, so the new model
+    inherits the FULL prior conversation (turns + tool calls + tool results +
+    file state), not just a truncated text re-injection.
+    """
+    meta = read_clara_model_override_meta()
+    return bool(meta.get("model")) and not bool(meta.get("handed_off"))
+
+
+def mark_clara_handoff_done() -> None:
+    """Mark the active model-swap override's one-shot handoff as consumed.
+
+    No-op when no override is set or it is already consumed. Rewrites the record
+    immutably (spreads existing fields) so a later ``off`` / new swap resets it.
+    Each fresh ``write_clara_model_override`` omits ``handed_off``, so a new swap
+    naturally re-arms the one-shot handoff.
+    """
+    meta = read_clara_model_override_meta()
+    if not meta.get("model") or meta.get("handed_off"):
+        return
+    updated = {**meta, "handed_off": True, "handed_off_at": time.time()}
+    path = clara_model_override_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(updated, fh, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def resolve_clara_model_alias(value: str) -> str:
+    """Map a friendly alias (opus/fable) to a concrete model id, else passthrough."""
+    normalized = str(value or "").strip()
+    return CLARA_MODEL_ALIASES.get(normalized.lower(), normalized)
+
+
 def bridge_config(config: dict[str, Any] | None) -> dict[str, Any]:
     """Merge supported Claude Code bridge config sections."""
     merged: dict[str, Any] = {}
@@ -145,6 +262,10 @@ def bridge_config(config: dict[str, Any] | None) -> dict[str, Any]:
             value = config.get(key)
             if isinstance(value, dict):
                 merged.update(value)
+    # Runtime /model-swap override wins over the static config model.
+    override = read_clara_model_override()
+    if override:
+        merged["model"] = override
     return merged
 
 
@@ -201,8 +322,8 @@ def _is_error_max_turns(parsed: dict[str, Any] | None, stderr: str = "", stdout:
         ]
         if any("error_max_turns" in str(value) for value in values if value is not None):
             return True
-    combined = f"{stderr}\n{stdout}"
-    return "error_max_turns" in combined
+    combined = f"{stderr}\n{stdout}".casefold()
+    return "error_max_turns" in combined or "reached maximum number of turns" in combined
 
 
 def _is_quota_or_spend_limit(parsed: dict[str, Any] | None, stderr: str = "", stdout: str = "") -> bool:
@@ -223,6 +344,27 @@ def _is_quota_or_spend_limit(parsed: dict[str, Any] | None, stderr: str = "", st
             return True
     combined = f"{stderr}\n{stdout}".casefold()
     return "monthly spend limit" in combined or "api_error_status\":429" in combined
+
+
+def _is_auth_failed(parsed: dict[str, Any] | None, stderr: str = "", stdout: str = "") -> bool:
+    """Detect Claude Code authentication failures across CLI/SDK result shapes."""
+    if isinstance(parsed, dict):
+        status = parsed.get("api_error_status")
+        if str(status).strip() == "401":
+            return True
+        values = [
+            parsed.get("subtype"),
+            parsed.get("error"),
+            parsed.get("error_type"),
+            parsed.get("type"),
+            parsed.get("message"),
+            parsed.get("result"),
+            parsed.get("sdk_exception"),
+        ]
+        if any("invalid authentication credentials" in str(value).casefold() for value in values if value is not None):
+            return True
+    combined = f"{stderr}\n{stdout}".casefold()
+    return "invalid authentication credentials" in combined or "api_error_status\":401" in combined or "authentication_failed" in combined
 
 
 def _format_failure_result(
@@ -251,6 +393,15 @@ def _format_failure_result(
             "⚠️ Clara Claude Code CLI가 Claude 계정 월 사용 한도에 걸려 실행되지 못했습니다.\n"
             "Claude 한도를 올리거나 다음 결제 주기까지 기다려야 Claude Code CLI 경로를 다시 사용할 수 있습니다.\n"
             "즉시 작업을 계속하려면 새 Wave pane에서 `hermes-hugo`를 실행해 Hugo/Codex 작업대로 진행하세요.\n"
+            f"job_id: {job_id}\n"
+            f"exit_code: {exit_code}\n"
+            f"log_dir: {log_dir}\n"
+        )
+    elif _is_auth_failed(parsed, stderr, stdout):
+        result_text = (
+            "⚠️ Clara Claude Code 인증이 실패했습니다.\n"
+            "Claude Code 로그인 상태는 남아 있지만 API가 401 Invalid authentication credentials를 반환했습니다.\n"
+            "해결: `claude auth login` 또는 `claude setup-token`으로 Claude Code 인증을 갱신해야 합니다.\n"
             f"job_id: {job_id}\n"
             f"exit_code: {exit_code}\n"
             f"log_dir: {log_dir}\n"
@@ -470,6 +621,27 @@ def build_continuity_context(*, hermes_home: Path, message: str, workdir: str | 
         f"Canonical Hermes home/session DB: {canonical_home}",
         "Use this context as a starting point. If it is insufficient and you have local file/shell access, inspect project files and/or ~/.hermes/state.db rather than assuming prior context is unavailable.",
     ]
+    swap_meta = read_clara_model_override_meta()
+    if swap_meta.get("model"):
+        current_model = str(swap_meta.get("model") or "").strip()
+        prior_model = str(swap_meta.get("from_model") or "").strip()
+        handoff = [
+            "\n## In-session model handoff (/model-swap) — CONTINUE SEAMLESSLY",
+            (
+                f"This pane switched its running model to '{current_model}'"
+                + (f" (previously '{prior_model}')" if prior_model else "")
+                + " mid-conversation via /model-swap."
+            ),
+            "The conversation history re-injected below is YOUR OWN prior context in this same pane and task.",
+            "Continue the ongoing work directly. Do NOT restart, re-introduce yourself, or ask the user to repeat what was already discussed. Carry the task forward from where the previous turn left off.",
+        ]
+        if not swap_meta.get("handed_off"):
+            handoff.append(
+                "This is the first turn after the swap: the previous model's FULL native Claude session "
+                "(all turns, tool calls, tool results, and file state) is being resumed under you now, "
+                "so treat it as a complete, seamless takeover — nothing was lost in the switch."
+            )
+        lines.extend(handoff)
     lines.extend(_handover_context_lines(workdir))
     terms = _extract_search_terms(message, workdir, {})
     snippets = _query_recent_session_snippets(canonical_home, terms)
@@ -913,6 +1085,14 @@ def run_claude_code_bridge_sync(
     resume_cfg = bcfg.get("resume_enabled")
     resume_disabled_config = isinstance(resume_cfg, bool) and not resume_cfg
     resume_enabled = not (resume_disabled_env or resume_disabled_config)
+    # One-shot 100% model-swap handoff: on the FIRST turn after /model-swap,
+    # force-resume the prior native session under the new model regardless of
+    # the steady-state resume_enabled config, and inject the FULL conversation
+    # text (history_limit=0) as a backstop. Consumed on success below.
+    force_handoff = clara_handoff_pending()
+    if force_handoff:
+        resume_enabled = True
+        history_limit = 0
     resume_session_id = _lookup_claude_session(
         hermes_home=hermes_home,
         bridge_session_key=bridge_session_key,
@@ -952,6 +1132,7 @@ def run_claude_code_bridge_sync(
         "bridge_session_key": _normalize_bridge_session_key(bridge_session_key),
         "resume_session_id": resume_session_id,
         "resume_enabled": resume_enabled,
+        "force_model_swap_handoff": force_handoff,
     }
     (log_dir / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1018,6 +1199,8 @@ def run_claude_code_bridge_sync(
         )
 
     if exit_code == 0 and parsed and not parsed.get("is_error"):
+        if force_handoff:
+            mark_clara_handoff_done()
         result_text = str(parsed.get("result") or "").strip()
         if not result_text:
             result_text = "Claude Code CLI completed but returned an empty result."
@@ -1172,6 +1355,13 @@ def run_claude_code_bridge_resident(
     resume_cfg = bcfg.get("resume_enabled")
     resume_disabled_config = isinstance(resume_cfg, bool) and not resume_cfg
     resume_enabled = not (resume_disabled_env or resume_disabled_config)
+    # One-shot 100% model-swap handoff (see run_claude_code_bridge_sync): the
+    # first turn after /model-swap force-resumes the prior native session under
+    # the new model and injects the FULL conversation text as a backstop.
+    force_handoff = clara_handoff_pending()
+    if force_handoff:
+        resume_enabled = True
+        history_limit = 0
     resume_session_id = _lookup_claude_session(
         hermes_home=hermes_home,
         bridge_session_key=bridge_session_key,
@@ -1227,12 +1417,14 @@ def run_claude_code_bridge_resident(
         "provider": "claude-code-cli",
         "delivery": "resident",
         "max_turns": max_turns,
+        "sdk_max_buffer_size": _as_int(bcfg.get("sdk_max_buffer_size"), 8 * 1024 * 1024),
         "allowed_tools": allowed_tools or "default",
         "timeout_seconds": timeout,
         "role_mode": role_mode,
         "bridge_session_key": _normalize_bridge_session_key(bridge_session_key),
         "resume_session_id": resume_session_id,
         "resume_enabled": resume_enabled,
+        "force_model_swap_handoff": force_handoff,
         "resident_idle_timeout_seconds": idle_timeout,
         "resident_max_processes": max_processes,
     }
@@ -1259,6 +1451,8 @@ def run_claude_code_bridge_resident(
                 include_partial_messages=bool(bcfg.get("sdk_include_partial_messages", True)),
                 include_hook_events=bool(bcfg.get("sdk_include_hook_events", False)),
                 resume_session_id=resume_session_id,
+                max_buffer_size=metadata["sdk_max_buffer_size"],
+                strict_mcp_config=_as_bool(bcfg.get("strict_mcp"), False),
                 log_dir=log_dir,
                 progress_callback=progress_callback,
             )
@@ -1276,6 +1470,8 @@ def run_claude_code_bridge_resident(
             )
             is_error = bool(parsed.get("is_error")) or str(parsed.get("subtype") or "success") != "success"
             exit_code = 1 if is_error else 0
+            if force_handoff and exit_code == 0:
+                mark_clara_handoff_done()
             result_text = _format_bridge_result_text(
                 parsed=parsed,
                 exit_code=exit_code,
@@ -1299,13 +1495,25 @@ def run_claude_code_bridge_resident(
                 raw_json=parsed,
             )
         except Exception as sdk_exc:
-            error_text = (
-                "⚠️ Clara Claude Agent SDK 경로가 실패했습니다.\n"
-                "현재 hermes-claude는 Sangkun 지시에 따라 Claude CLI fallback을 자동 실행하지 않습니다.\n"
-                f"오류: {type(sdk_exc).__name__}: {sdk_exc}\n"
-                f"job_id: {job_id}\n"
-                f"log_dir: {log_dir}\n"
-            )
+            error_detail = f"{type(sdk_exc).__name__}: {sdk_exc}"
+            if _is_error_max_turns(None, stdout=error_detail):
+                error_text = _format_failure_result(
+                    parsed=None,
+                    stderr="",
+                    stdout=error_detail,
+                    job_id=job_id,
+                    exit_code=1,
+                    log_dir=log_dir,
+                    max_turns=max_turns,
+                )
+            else:
+                error_text = (
+                    "⚠️ Clara Claude Agent SDK 경로가 실패했습니다.\n"
+                    "현재 hermes-claude는 Sangkun 지시에 따라 Claude CLI fallback을 자동 실행하지 않습니다.\n"
+                    f"오류: {error_detail}\n"
+                    f"job_id: {job_id}\n"
+                    f"log_dir: {log_dir}\n"
+                )
             (log_dir / "sdk-error.log").write_text(error_text, encoding="utf-8")
             if progress_callback is not None:
                 try:
@@ -1395,6 +1603,8 @@ def run_claude_code_bridge_resident(
 
     is_error = bool(parsed.get("is_error")) or str(parsed.get("subtype") or "success") != "success"
     exit_code = 1 if is_error else 0
+    if force_handoff and exit_code == 0:
+        mark_clara_handoff_done()
     if progress_callback is not None:
         try:
             progress_callback("resident.completed", f"Claude Code resident 작업 종료: exit {exit_code}", {"job_id": job_id})
