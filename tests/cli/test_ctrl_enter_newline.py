@@ -63,6 +63,22 @@ def test_ghostty_tmux_session_preserves_ctrl_j_newline():
             assert cli_mod._preserve_ctrl_enter_newline() is True
 
 
+def test_vscode_integrated_terminal_preserves_pasted_lf_newline():
+    """VS Code still preserves Ctrl+Enter/newline, but plain Enter must remain submit."""
+    import cli as cli_mod
+    with patch.object(sys, "platform", "darwin"):
+        with patch.dict(os.environ, {"TERM_PROGRAM": "vscode"}, clear=True):
+            assert cli_mod._preserve_ctrl_enter_newline() is True
+
+
+def test_vscode_ipc_hook_preserves_pasted_lf_newline_when_term_program_scrubbed():
+    """Keep Ctrl+Enter/newline behavior when VS Code leaves only its IPC hook."""
+    import cli as cli_mod
+    with patch.object(sys, "platform", "darwin"):
+        with patch.dict(os.environ, {"VSCODE_IPC_HOOK_CLI": "/tmp/vscode-ipc.sock"}, clear=True):
+            assert cli_mod._preserve_ctrl_enter_newline() is True
+
+
 def test_pure_local_linux_does_not_preserve():
     """A bare local Linux TTY (no SSH/WSL/WT/Ghostty) keeps c-j → submit so docker exec
     style Enter-as-LF stays usable."""
@@ -115,3 +131,16 @@ def test_install_ctrl_enter_alias_idempotent():
     install_ctrl_enter_alias()
     second = install_ctrl_enter_alias()
     assert second == 0  # no further changes after first install
+
+
+def test_install_arrow_key_aliases_maps_extended_no_modifier_sequences():
+    """VS Code/tmux can emit ESC [ 1 ; 1 <arrow>; map it to normal arrows."""
+    from hermes_cli.pt_input_extras import install_arrow_key_aliases
+    from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+    from prompt_toolkit.keys import Keys
+
+    install_arrow_key_aliases()
+    assert ANSI_SEQUENCES.get("\x1b[1;1A") == Keys.Up
+    assert ANSI_SEQUENCES.get("\x1b[1;1B") == Keys.Down
+    assert ANSI_SEQUENCES.get("\x1b[1;1C") == Keys.Right
+    assert ANSI_SEQUENCES.get("\x1b[1;1D") == Keys.Left
