@@ -4215,12 +4215,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return os.environ.get("HERMES_LEAD_MODE") or ""
 
     def _get_claude_code_display_model(self, *, compact: bool = True) -> str:
-        """Return the visible model label for the Clara/Claude Code SDK pane."""
+        """Return the visible model label for the Clara/Claude Code SDK pane.
+
+        Mirrors the bridge's actual model resolution priority so the banner and
+        status bar never show a stale name after /model-swap:
+        runtime override (clara-model-override.json) > clara_cli/claude_code_cli
+        config model > ~/.claude/settings.json default.
+        """
         claude_model = ""
         try:
-            bridge_cfg = (getattr(self, "config", {}) or {}).get("claude_code_cli") or (getattr(self, "config", {}) or {}).get("clara_cli") or {}
-            if isinstance(bridge_cfg, dict):
-                claude_model = str(bridge_cfg.get("model") or "").strip()
+            try:
+                from gateway.claude_code_bridge import read_clara_model_override
+
+                claude_model = read_clara_model_override()
+            except Exception:
+                claude_model = ""
+            if not claude_model:
+                bridge_cfg = (getattr(self, "config", {}) or {}).get("claude_code_cli") or (getattr(self, "config", {}) or {}).get("clara_cli") or {}
+                if isinstance(bridge_cfg, dict):
+                    claude_model = str(bridge_cfg.get("model") or "").strip()
             if not claude_model:
                 settings_path = Path.home() / ".claude" / "settings.json"
                 if settings_path.exists():
