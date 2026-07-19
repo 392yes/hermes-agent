@@ -10585,23 +10585,53 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
 
-        # Refresh provider credentials if needed (handles key rotation transparently)
-        if not self._ensure_runtime_credentials():
-            return None
+        # Bridge-profile turns (profile config pins model.provider:
+        # claude-code-cli — e.g. clara/reviewer bot profiles) never resolve a
+        # normal API provider. Skip credential refresh + agent init for them:
+        # resolve_provider() would raise "Unknown provider 'claude-code-cli'"
+        # and kill kanban workers spawned for bridge profiles before the
+        # bridge routing below could ever run. Mirrors the config-based
+        # is_claude_code_cli_config() routing the Slack gateway already does.
+        # NOTE: intentionally config-based only — bot profiles must not read
+        # the orchestrator lead-mode file (bot-independence rule); clara-lead
+        # panes keep their existing init + mode-based routing unchanged.
+        _turn_via_claude_code_profile = False
+        try:
+            from gateway.claude_code_bridge import is_claude_code_cli_config as _is_ccc_cfg
+            _turn_via_claude_code_profile = _is_ccc_cfg(getattr(self, "config", {}) or {})
+        except Exception:
+            _turn_via_claude_code_profile = False
 
-        turn_route = self._resolve_turn_agent_config(message)
-        if turn_route["signature"] != self._active_agent_route_signature:
-            self.agent = None
+        # An explicit HERMES_LEAD_MODE=hugo-lead pin (e.g. the hermes-codex
+        # launcher) must always keep the pane on its configured Codex provider.
+        # A leaked clara_cli.enabled=true in the shared main config must not
+        # override that pin into the Claude bridge. clara-lead panes (env pin
+        # clara-lead) and bot profiles (no env pin) are unaffected.
+        try:
+            from gateway.orchestrator_modes import env_pinned_mode as _env_pin, MODE_HUGO_LEAD as _HUGO
+            if _turn_via_claude_code_profile and _env_pin() == _HUGO:
+                _turn_via_claude_code_profile = False
+        except Exception:
+            pass
 
-        # Initialize agent if needed
-        if self.agent is None:
-            _cprint(f"{_DIM}Initializing agent...{_RST}")
-        if not self._init_agent(
-            model_override=turn_route["model"],
-            runtime_override=turn_route["runtime"],
-            request_overrides=turn_route.get("request_overrides"),
-        ):
-            return None
+        if not _turn_via_claude_code_profile:
+            # Refresh provider credentials if needed (handles key rotation transparently)
+            if not self._ensure_runtime_credentials():
+                return None
+
+            turn_route = self._resolve_turn_agent_config(message)
+            if turn_route["signature"] != self._active_agent_route_signature:
+                self.agent = None
+
+            # Initialize agent if needed
+            if self.agent is None:
+                _cprint(f"{_DIM}Initializing agent...{_RST}")
+            if not self._init_agent(
+                model_override=turn_route["model"],
+                runtime_override=turn_route["runtime"],
+                request_overrides=turn_route.get("request_overrides"),
+            ):
+                return None
         
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -10825,12 +10855,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     agent_message = _prepend_note_to_message(agent_message, _srn)
                     self._pending_skills_reload_note = None
                 try:
-                    route_via_claude_code = False
-                    try:
-                        from gateway.orchestrator_modes import MODE_CLARA_LEAD, read_mode
-                        route_via_claude_code = read_mode(get_hermes_home()).get("mode") == MODE_CLARA_LEAD
-                    except Exception:
-                        route_via_claude_code = False
+                    # Config-pinned bridge profiles route unconditionally;
+                    # otherwise fall back to the orchestrator-mode check
+                    # (main-home interactive clara-lead panes only).
+                    route_via_claude_code = _turn_via_claude_code_profile
+                    if not route_via_claude_code:
+                        try:
+                            from gateway.orchestrator_modes import MODE_CLARA_LEAD, read_mode
+                            route_via_claude_code = read_mode(get_hermes_home()).get("mode") == MODE_CLARA_LEAD
+                        except Exception:
+                            route_via_claude_code = False
 
                     if route_via_claude_code:
                         # clara-lead is not a display-only mode.  In CLI/Wave as
@@ -10917,10 +10951,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             except Exception:
                                 pass
 
+                        # Kanban workers spawn as ``hermes -p <profile> chat -q
+                        # "work kanban task <id>"``. The bridge prompt carries no
+                        # KANBAN_GUIDANCE and Claude Code has no kanban_* tools,
+                        # so hand it the explicit CLI lifecycle for this task —
+                        # without the mandatory complete/block transition the
+                        # dispatcher records the run as a crash.
+                        _kanban_task_env = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+                        _kanban_bridge_ctx = None
+                        if _kanban_task_env:
+                            _hermes_bin = shutil.which("hermes") or "hermes"
+                            _kanban_bridge_ctx = (
+                                "# Hermes kanban worker turn\n"
+                                f"You are the assigned worker for kanban task {_kanban_task_env}.\n"
+                                f"1. Run `{_hermes_bin} kanban show {_kanban_task_env}` to read the task title, body and comments.\n"
+                                "2. Do the work the body asks for. For a [대화 모드] task, compose the short "
+                                "conversational reply requested — that text becomes the chat answer.\n"
+                                "3. MANDATORY final step — run exactly one of:\n"
+                                f"   - success: `{_hermes_bin} kanban complete {_kanban_task_env} --result '<your reply text>'`\n"
+                                f"   - blocked: `{_hermes_bin} kanban block {_kanban_task_env} '<why you are blocked>'`\n"
+                                "Skipping this transition makes the dispatcher record this run as a crash.\n"
+                                "Obey the safety rules in the task body; never run deploy/push/ERP/business-write actions."
+                            )
                         bridge_result = _bridge_runner(
                             config=_bridge_config,
                             message=agent_message,
-                            context_prompt=None,
+                            context_prompt=_kanban_bridge_ctx,
                             channel_prompt=None,
                             history=self.conversation_history[:-1],  # Exclude the message we just added
                             hermes_home=get_hermes_home(),
