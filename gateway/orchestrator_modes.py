@@ -25,6 +25,11 @@ MODE_HUGO_LEAD = "hugo-lead"
 MODE_CLARA_LEAD = "clara-lead"
 VALID_MODES = {MODE_HUGO_LEAD, MODE_CLARA_LEAD}
 
+# Source prefixes that identify automated / non-interactive callers.  Such
+# sources may observe the lead mode but must never *switch* it: only a human
+# (or otherwise explicit) command may flip the global lead.  See write_mode.
+AUTO_SOURCE_PREFIXES = ("auto:", "sync:", "cron:", "daemon:", "import:", "handover:", "bot:")
+
 _MODE_FILE = "runtime/orchestrator-mode.json"
 
 # Per-process lead-mode pin.  When set (e.g. `HERMES_LEAD_MODE=hugo-lead hermes`
@@ -121,10 +126,42 @@ def read_mode(hermes_home: Path | None = None) -> dict[str, Any]:
     return data
 
 
+def _is_auto_source(source: str | None) -> bool:
+    """Return True if ``source`` names an automated / non-interactive caller."""
+    text = str(source or "").strip().casefold()
+    return text.startswith(AUTO_SOURCE_PREFIXES)
+
+
 def write_mode(mode: str, *, hermes_home: Path | None = None, source: str = "gateway") -> dict[str, Any]:
     normalized = normalize_mode(mode)
     if normalized not in VALID_MODES:
         raise ValueError(f"unknown orchestrator mode: {mode}")
+    # Auto/non-interactive sources may not flip the lead mode.  Compare the
+    # requested mode against the currently persisted one; anything that would
+    # be a real switch is refused without touching disk, while a same-mode
+    # request is a harmless no-op we also skip rewriting for.
+    if _is_auto_source(source):
+        current = read_mode(hermes_home)
+        current_mode = current.get("mode") or MODE_HUGO_LEAD
+        existing_updated_at = current.get("updated_at")
+        if normalized != current_mode:
+            return {
+                "mode": current_mode,
+                "updated_at": existing_updated_at,
+                "source": source,
+                "blocked": True,
+                "reason": (
+                    f"auto source '{source}' cannot switch lead mode "
+                    f"({current_mode} -> {normalized}); human command required"
+                ),
+            }
+        return {
+            "mode": current_mode,
+            "updated_at": existing_updated_at,
+            "source": source,
+            "blocked": False,
+            "noop": True,
+        }
     path = mode_path(hermes_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
