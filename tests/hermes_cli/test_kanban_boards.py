@@ -133,6 +133,18 @@ class TestPathResolution:
         assert kb.kanban_db_path() == forced
         assert kb.kanban_db_path(board="ignored") == forced
 
+    def test_connect_explicit_board_ignores_stale_db_override(
+        self, fresh_home, tmp_path, monkeypatch
+    ):
+        forced = tmp_path / "stale.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        conn = kb.connect(board="target")
+        try:
+            actual = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        finally:
+            conn.close()
+        assert actual == fresh_home / "kanban" / "boards" / "target" / "kanban.db"
+
     def test_env_var_workspaces_override(self, fresh_home, tmp_path, monkeypatch):
         forced = tmp_path / "ws"
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(forced))
@@ -399,6 +411,10 @@ class TestWorkerSpawnEnv:
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         kb.create_board("spawntest")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(fresh_home / "stale.db"))
+        monkeypatch.setenv(
+            "HERMES_KANBAN_WORKSPACES_ROOT", str(fresh_home / "stale-workspaces")
+        )
 
         task = kb.Task(
             id="t_abc",

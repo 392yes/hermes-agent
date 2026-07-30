@@ -406,6 +406,16 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _canonical_board_db_path(board: Optional[str]) -> Path:
+    """Resolve a board DB without consulting process-level path overrides."""
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -423,12 +433,17 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
         return Path(override).expanduser()
+    return _canonical_board_db_path(board)
+
+
+def _canonical_workspaces_root(board: Optional[str]) -> Path:
+    """Resolve a board workspace root without inherited env-path pins."""
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+        return kanban_home() / "kanban" / "workspaces"
+    return board_dir(slug) / "workspaces"
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -445,12 +460,7 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban" / "workspaces"
-    return board_dir(slug) / "workspaces"
+    return _canonical_workspaces_root(board)
 
 
 def attachments_root(board: Optional[str] = None) -> Path:
@@ -898,6 +908,7 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    worker_capability_hash: Optional[str]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
     started_at: int
@@ -922,6 +933,11 @@ class Run:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             worker_pid=row["worker_pid"],
+            worker_capability_hash=(
+                row["worker_capability_hash"]
+                if "worker_capability_hash" in row.keys()
+                else None
+            ),
             max_runtime_seconds=row["max_runtime_seconds"],
             last_heartbeat_at=row["last_heartbeat_at"],
             started_at=int(row["started_at"]),
@@ -1080,6 +1096,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_capability_hash TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -1437,8 +1454,12 @@ def connect(
     """
     if db_path is not None:
         path = db_path
+    elif board is not None:
+        # An explicit board is an identity boundary. A stale path pin inherited
+        # from another worker must not redirect this connection to another DB.
+        path = _canonical_board_db_path(board)
     else:
-        path = kanban_db_path(board=board)
+        path = kanban_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with _cross_process_init_lock(path):
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
@@ -1714,6 +1735,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
 
+    run_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_runs'"
+    ).fetchone() is not None
+    if run_table_exists:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "worker_capability_hash" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "worker_capability_hash",
+                "worker_capability_hash TEXT",
+            )
+
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
     # tables don't fail during SCHEMA_SQL execution before ``run_id`` exists.
@@ -1843,7 +1879,8 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_capability_hash TEXT,"
+        " max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -2757,8 +2794,7 @@ def _end_run(
                metadata      = ?,
                ended_at      = ?,
                claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
+               claim_expires = NULL
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -3284,7 +3320,11 @@ def release_stale_claims(
             continue
 
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            row["worker_pid"],
+            row["claim_lock"],
+            task_id=row["id"],
+            expected_start_time=_worker_process_start_time(row["worker_pid"]),
+            signal_fn=signal_fn,
         )
         with write_txn(conn):
             cur = conn.execute(
@@ -3355,16 +3395,16 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
-    )
+    worker_pid = row["worker_pid"]
+    expected_start_time = _worker_process_start_time(worker_pid)
+    reclaim_lock = f"reclaim:{secrets.token_urlsafe(24)}"
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = 'blocked', claim_lock = ?, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            (reclaim_lock, task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False
@@ -3375,24 +3415,129 @@ def reclaim_task(
                 f"manual_reclaim: {reason}" if reason
                 else f"manual_reclaim lock={prev_lock}"
             ),
-            metadata=termination,
+            metadata={"termination_pending": bool(worker_pid)},
         )
-        payload = {
-            "manual": True,
-            "reason": reason,
-            "prev_lock": prev_lock,
-        }
-        payload.update(termination)
         _append_event(
-            conn, task_id, "reclaimed",
-            payload,
+            conn,
+            task_id,
+            "reclaiming",
+            {"manual": True, "reason": reason, "prev_lock": prev_lock},
             run_id=run_id,
         )
+
+    termination = _terminate_reclaimed_worker(
+        worker_pid,
+        prev_lock,
+        task_id=task_id,
+        expected_start_time=expected_start_time,
+        signal_fn=signal_fn,
+    )
+    if worker_pid and _pid_alive(worker_pid):
+        return False
+    payload = {
+        "manual": True,
+        "reason": reason,
+        "prev_lock": prev_lock,
+    }
+    payload.update(termination)
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL "
+            "WHERE id = ? AND status = 'blocked' AND claim_lock = ?",
+            (task_id, reclaim_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ? AND outcome = 'reclaimed'",
+            (json.dumps(termination, ensure_ascii=False), run_id),
+        )
+        _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
     # Operator intervention — they've looked at the task, so the
     # consecutive-failures counter is now stale. Give the next retry
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
+    return True
+
+
+def cancel_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    signal_fn=None,
+) -> bool:
+    """Cancel a task without exposing a transient ready/re-spawn state.
+
+    Reclaim intentionally returns work to ``ready``; cancellation instead
+    terminates the observed host-local worker, closes its run as cancelled,
+    and emits a sticky blocked event. The final update is guarded by the
+    observed status and claim lock so a superseded run is never cancelled.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["status"] in {"done", "archived"}:
+        return False
+
+    previous_status = str(row["status"])
+    previous_lock = row["claim_lock"]
+    worker_pid = row["worker_pid"]
+    expected_start_time = _worker_process_start_time(worker_pid)
+    cancel_reason = (reason or "cancelled by operator").strip()
+
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = ? AND claim_lock IS ?",
+            (task_id, previous_status, previous_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="cancelled",
+            status="cancelled",
+            summary=cancel_reason,
+            metadata={"termination_pending": bool(worker_pid)},
+        )
+        if run_id is None:
+            run_id = _synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="cancelled",
+                summary=cancel_reason,
+                metadata={"termination_pending": bool(worker_pid)},
+            )
+        # _has_sticky_block() keys off this event and therefore prevents the
+        # dispatcher from silently re-promoting a cancelled task.
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {"reason": cancel_reason, "cancelled": True},
+            run_id=run_id,
+        )
+
+    termination = _terminate_reclaimed_worker(
+        worker_pid,
+        previous_lock,
+        task_id=task_id,
+        expected_start_time=expected_start_time,
+        signal_fn=signal_fn,
+    )
+    payload = {"reason": cancel_reason, "cancelled": True}
+    payload.update(termination)
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ? AND outcome = 'cancelled'",
+            (json.dumps(termination, ensure_ascii=False), run_id),
+        )
+        _append_event(conn, task_id, "cancelled", payload, run_id=run_id)
     return True
 
 
@@ -3568,6 +3713,8 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    expected_worker_capability: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -3598,6 +3745,9 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    if isinstance(metadata, dict):
+        metadata = dict(metadata)
+        metadata.pop("_hermes_worker_attestation", None)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -3627,6 +3777,32 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
+        if expected_worker_capability is not None:
+            if expected_run_id is None or expected_claim_lock is None:
+                return False
+            auth = conn.execute(
+                "SELECT profile, worker_pid, worker_capability_hash "
+                "FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            supplied_hash = hashlib.sha256(
+                expected_worker_capability.encode("utf-8")
+            ).hexdigest()
+            if (
+                auth is None
+                or auth["worker_pid"] is None
+                or not auth["worker_capability_hash"]
+                or not secrets.compare_digest(
+                    str(auth["worker_capability_hash"]), supplied_hash
+                )
+            ):
+                return False
+            metadata = dict(metadata or {})
+            metadata["_hermes_worker_attestation"] = {
+                "run_id": int(expected_run_id),
+                "profile": auth["profile"],
+                "capability_hash": supplied_hash,
+            }
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -3642,7 +3818,7 @@ def complete_task(
                 """,
                 (result, now, task_id),
             )
-        else:
+        elif expected_claim_lock is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -3657,6 +3833,29 @@ def complete_task(
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked')
+                   AND current_run_id = ?
+                   AND claim_lock IS ?
+                """,
+                (
+                    result,
+                    now,
+                    task_id,
+                    int(expected_run_id),
+                    expected_claim_lock,
+                ),
             )
         if cur.rowcount != 1:
             return False
@@ -4115,9 +4314,31 @@ def block_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    expected_worker_capability: Optional[str] = None,
 ) -> bool:
     """Transition ``running -> blocked``."""
     with write_txn(conn):
+        if expected_worker_capability is not None:
+            if expected_run_id is None or expected_claim_lock is None:
+                return False
+            auth = conn.execute(
+                "SELECT worker_pid, worker_capability_hash FROM task_runs "
+                "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            supplied_hash = hashlib.sha256(
+                expected_worker_capability.encode("utf-8")
+            ).hexdigest()
+            if (
+                auth is None
+                or auth["worker_pid"] is None
+                or not auth["worker_capability_hash"]
+                or not secrets.compare_digest(
+                    str(auth["worker_capability_hash"]), supplied_hash
+                )
+            ):
+                return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4131,7 +4352,7 @@ def block_task(
                 """,
                 (task_id,),
             )
-        else:
+        elif expected_claim_lock is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4144,6 +4365,21 @@ def block_task(
                    AND current_run_id = ?
                 """,
                 (task_id, int(expected_run_id)),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'blocked',
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                   AND current_run_id = ?
+                   AND claim_lock IS ?
+                """,
+                (task_id, int(expected_run_id), expected_claim_lock),
             )
         if cur.rowcount != 1:
             return False
@@ -5084,6 +5320,8 @@ def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
+    task_id: Optional[str] = None,
+    expected_start_time: Optional[float] = None,
     signal_fn=None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
@@ -5092,6 +5330,7 @@ def _terminate_reclaimed_worker(
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
+        "identity_verified": False,
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
@@ -5104,9 +5343,26 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
-    )
+    if signal_fn is None:
+        if (
+            not task_id
+            or expected_start_time is None
+            or not _worker_process_identity_matches(
+                int(pid),
+                task_id,
+                expected_start_time=expected_start_time,
+            )
+        ):
+            return info
+        kill = (
+            os.kill
+            if _IS_WINDOWS
+            else (lambda target_pid, sig: os.killpg(int(target_pid), sig))
+        )
+    else:
+        # Injected signal functions are an explicit unit-test boundary.
+        kill = signal_fn
+    info["identity_verified"] = True
     if kill is None:
         return info
 
@@ -5123,6 +5379,16 @@ def _terminate_reclaimed_worker(
         time.sleep(0.5)
 
     if _pid_alive(pid):
+        if signal_fn is None and (
+            not task_id
+            or expected_start_time is None
+            or not _worker_process_identity_matches(
+                int(pid),
+                task_id,
+                expected_start_time=expected_start_time,
+            )
+        ):
+            return info
         try:
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
@@ -5371,7 +5637,11 @@ def detect_stale_running(
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+            pid,
+            lock,
+            task_id=tid,
+            expected_start_time=_worker_process_start_time(pid),
+            signal_fn=signal_fn,
         )
 
         with write_txn(conn):
@@ -5805,25 +6075,195 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    worker_capability: Optional[str] = None,
+) -> bool:
+    """Atomically publish a worker PID and one-time completion capability.
 
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+    Publication is accepted only while the exact claimed run is still active.
+    This closes the spawn→PID race: a cancellation/completion that wins before
+    publication leaves no active row for this compare-and-swap, so the caller
+    can stop the just-spawned process instead of attaching it to a newer run.
     """
+    capability_hash = (
+        hashlib.sha256(worker_capability.encode("utf-8")).hexdigest()
+        if worker_capability
+        else None
+    )
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return False
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else (int(row["current_run_id"]) if row["current_run_id"] else None)
         )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
-            )
+        claim_lock = (
+            expected_claim_lock
+            if expected_claim_lock is not None
+            else row["claim_lock"]
+        )
+        if (
+            run_id is None
+            or row["current_run_id"] != run_id
+            or row["claim_lock"] != claim_lock
+        ):
+            return False
+        run_cur = conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, worker_capability_hash = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL "
+            "AND claim_lock IS ?",
+            (int(pid), capability_hash, run_id, task_id, claim_lock),
+        )
+        if run_cur.rowcount != 1:
+            return False
+        task_cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ? AND status = 'running' "
+            "AND current_run_id = ? AND claim_lock IS ?",
+            (int(pid), task_id, run_id, claim_lock),
+        )
+        if task_cur.rowcount != 1:
+            raise RuntimeError("worker publication lost task claim after run CAS")
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+    return True
+
+
+def _worker_process_start_time(pid: Optional[int]) -> Optional[float]:
+    if not pid or pid <= 0:
+        return None
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:
+        return None
+
+
+def _worker_process_identity_matches(
+    pid: int,
+    task_id: str,
+    *,
+    started_after: Optional[float] = None,
+    expected_start_time: Optional[float] = None,
+) -> bool:
+    """Fail-closed identity check for a dispatcher-created worker process."""
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(int(pid))
+        create_time = float(proc.create_time())
+        if started_after is not None and create_time + 1.0 < started_after:
+            return False
+        if (
+            expected_start_time is not None
+            and abs(create_time - float(expected_start_time)) >= 0.001
+        ):
+            return False
+        cmdline = [str(part) for part in proc.cmdline()]
+        if not any(task_id in part for part in cmdline):
+            return False
+        if not _IS_WINDOWS and os.getpgid(int(pid)) != int(pid):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _terminate_unpublished_worker(
+    pid: int,
+    task_id: str,
+    *,
+    started_after: float,
+) -> bool:
+    """Stop a just-spawned worker whose run publication lost its CAS."""
+    import signal
+
+    if not _pid_alive(int(pid)):
+        return True
+    if not _worker_process_identity_matches(
+        int(pid), task_id, started_after=started_after
+    ):
+        return False
+    try:
+        if _IS_WINDOWS:
+            os.kill(int(pid), signal.SIGTERM)
+        else:
+            os.killpg(int(pid), signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        return not _pid_alive(int(pid))
+    for _ in range(20):
+        if not _pid_alive(int(pid)):
+            return True
+        time.sleep(0.1)
+    try:
+        if _IS_WINDOWS:
+            os.kill(int(pid), getattr(signal, "SIGKILL", signal.SIGTERM))
+        else:
+            os.killpg(int(pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+    return not _pid_alive(int(pid))
+
+
+def _spawn_and_publish_worker(
+    conn: sqlite3.Connection,
+    claimed: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+    spawn_fn,
+) -> tuple[Optional[int], bool]:
+    """Spawn one worker and atomically bind it to the exact claimed run."""
+    import inspect
+
+    capability = secrets.token_urlsafe(32)
+    passed_capability = False
+    spawned_after = time.time()
+    try:
+        sig = inspect.signature(spawn_fn)
+    except (TypeError, ValueError):
+        pid = spawn_fn(claimed, workspace)
+    else:
+        has_kwargs = any(
+            param.kind is inspect.Parameter.VAR_KEYWORD
+            for param in sig.parameters.values()
+        )
+        kwargs: dict[str, Any] = {}
+        if "board" in sig.parameters or has_kwargs:
+            kwargs["board"] = board
+        if "worker_capability" in sig.parameters or has_kwargs:
+            kwargs["worker_capability"] = capability
+            passed_capability = True
+        pid = spawn_fn(claimed, workspace, **kwargs)
+    if not pid:
+        return None, True
+    published = _set_worker_pid(
+        conn,
+        claimed.id,
+        int(pid),
+        expected_run_id=claimed.current_run_id,
+        expected_claim_lock=claimed.claim_lock,
+        worker_capability=(capability if passed_capability else None),
+    )
+    if published:
+        return int(pid), True
+    if not _terminate_unpublished_worker(
+        int(pid), claimed.id, started_after=spawned_after
+    ):
+        raise RuntimeError(
+            f"spawn publication lost for {claimed.id}; worker identity could not be stopped"
+        )
+    return int(pid), False
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -6297,20 +6737,15 @@ def dispatch_once(
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            pid, published = _spawn_and_publish_worker(
+                conn,
+                claimed,
+                str(workspace),
+                board=board,
+                spawn_fn=_spawn,
+            )
+            if not published:
+                continue
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -6389,17 +6824,15 @@ def dispatch_once(
         claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            pid, published = _spawn_and_publish_worker(
+                conn,
+                claimed,
+                str(workspace),
+                board=board,
+                spawn_fn=_spawn,
+            )
+            if not published:
+                continue
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
@@ -6709,11 +7142,61 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _profile_uses_claude_code_bridge(hermes_home: Optional[str]) -> bool:
+    """Read one profile config under an isolated home override."""
+    if not hermes_home:
+        return False
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config
+        from gateway.claude_code_bridge import is_claude_code_cli_config
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            return is_claude_code_cli_config(load_config())
+        finally:
+            reset_hermes_home_override(token)
+    except Exception as exc:
+        _log.debug(
+            "kanban worker: could not inspect bridge provider for HERMES_HOME=%r (%s)",
+            hermes_home,
+            exc,
+        )
+        return False
+
+
+_CLARA_CLSE_ENV_ALLOWLIST = {
+    "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "TMP", "TEMP",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "COLORTERM",
+    "NO_COLOR", "FORCE_COLOR", "TERM_PROGRAM", "TERM_PROGRAM_VERSION",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "SSL_CERT_FILE",
+    "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "HTTP_PROXY",
+    "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy",
+    "all_proxy", "no_proxy", "PYTHONPATH", "VIRTUAL_ENV", "NVM_DIR",
+    "VOLTA_HOME", "BUN_INSTALL", "GOPATH", "GOROOT", "CARGO_HOME",
+    "RUSTUP_HOME", "JAVA_HOME", "SDKROOT", "DEVELOPER_DIR", "SYSTEMROOT",
+    "WINDIR", "COMSPEC", "PATHEXT", "HOMEDRIVE", "HOMEPATH",
+    "LOCALAPPDATA", "APPDATA", "PROGRAMDATA", "PROGRAMFILES",
+    "PROGRAMFILES(X86)", "USERPROFILE", "NUMBER_OF_PROCESSORS",
+    "AGENT_BROWSER_EXECUTABLE_PATH", "PLAYWRIGHT_BROWSERS_PATH", "CHROME_PATH",
+}
+
+
+def _clara_clse_worker_env() -> dict[str, str]:
+    """Build a minimal parent-independent environment for isolated workers."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key in _CLARA_CLSE_ENV_ALLOWLIST or key.startswith("LC_")
+    }
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
+    worker_capability: Optional[str] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -6734,9 +7217,84 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+    normalized_board = (_normalize_board_slug(board) or "").casefold()
+    isolated_worker = profile_arg in {"clive", "clse", "coda"} or normalized_board.startswith(
+        ("clara-clive", "clara-clse")
+    )
+    if isolated_worker:
+        workspace_path = Path(workspace).expanduser()
+        if (
+            not workspace_path.is_absolute()
+            or workspace_path.is_symlink()
+            or not workspace_path.is_dir()
+        ):
+            raise RuntimeError(
+                f"Clara-Clive worker workspace is missing or unsafe: {workspace}"
+            )
+        resolved_workspace = workspace_path.resolve(strict=True)
+        if task.workspace_path:
+            expected_workspace = Path(task.workspace_path).expanduser().resolve(
+                strict=True
+            )
+            if resolved_workspace != expected_workspace:
+                raise RuntimeError(
+                    "Clara-Clive worker workspace does not match the task record: "
+                    f"{resolved_workspace} != {expected_workspace}"
+                )
+        workspace = str(resolved_workspace)
 
     prompt = f"work kanban task {task.id}"
-    env = dict(os.environ)
+    env = _clara_clse_worker_env() if isolated_worker else dict(os.environ)
+
+    # A named Kanban worker is a profile-isolated runtime. Parent orchestrator
+    # launchers may pin lead/provider/model overrides in their environment, but
+    # those controls must never leak into the assigned worker and silently turn
+    # (for example) Clive into Clara/Hugo. The worker's profile config below is
+    # the sole authority for its runtime identity.
+    for parent_override in (
+        "HERMES_LEAD_MODE",
+        "HERMES_INFERENCE_PROVIDER",
+        "HERMES_MODEL",
+        "HERMES_PROVIDER",
+    ):
+        env.pop(parent_override, None)
+
+    # Clara→Clive/Coda jobs are isolated from the parent lead's credentials and
+    # nested-agent markers. Each named profile loads its own auth files;
+    # arbitrary API keys, cloud credentials, SSH agents, and stale task
+    # identities must not cross this worker boundary.
+    if isolated_worker:
+        exact_sensitive = {
+            "SSH_AUTH_SOCK",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+        }
+        sensitive_prefixes = (
+            "AWS_", "AZURE_", "GCP_", "GOOGLE_CLOUD_", "GH_", "GITHUB_",
+            "SLACK_", "DISCORD_", "TELEGRAM_",
+        )
+        sensitive_suffixes = (
+            "_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS",
+        )
+        for key in list(env):
+            upper = key.upper()
+            if (
+                key in exact_sensitive
+                or upper.startswith(sensitive_prefixes)
+                or upper.endswith(sensitive_suffixes)
+                or upper.startswith("HERMES_KANBAN_")
+            ):
+                env.pop(key, None)
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_ASKPASS"] = "/usr/bin/false"
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_SSH_COMMAND"] = "/usr/bin/false"
+        env["SSH_ASKPASS"] = "/usr/bin/false"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -6748,8 +7306,20 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+    profile_home: Optional[str] = None
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        profile_home = resolve_profile_env(profile_arg)
+        if _profile_uses_claude_code_bridge(profile_home):
+            # The CLI must start from the canonical root so `-p <name>` runs
+            # its profile-override path before bridge-provider detection. If
+            # HERMES_HOME is pre-pinned to that same profile, the second
+            # override resolves incorrectly and normal provider resolution
+            # rejects the sentinel `claude-code-cli` provider.
+            from hermes_constants import get_default_hermes_root
+
+            env["HERMES_HOME"] = str(get_default_hermes_root())
+        else:
+            env["HERMES_HOME"] = profile_home
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
@@ -6766,6 +7336,8 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if worker_capability:
+        env["HERMES_KANBAN_WORKER_CAPABILITY"] = worker_capability
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
@@ -6791,12 +7363,14 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
-    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
-    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    resolved_board = _normalize_board_slug(board) or get_current_board()
+    env["HERMES_KANBAN_DB"] = str(_canonical_board_db_path(resolved_board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(
+        _canonical_workspaces_root(resolved_board)
+    )
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
     # board slug still forces it to the right directory.
-    resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
@@ -6804,8 +7378,13 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    worker_entrypoint = (
+        [sys.executable, "-m", "hermes_cli.main"]
+        if isolated_worker
+        else _resolve_hermes_argv()
+    )
     cmd = [
-        *_resolve_hermes_argv(),
+        *worker_entrypoint,
         "-p", profile_arg,
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
         # so they see that profile's shell-hook allowlist instead of the
@@ -6827,7 +7406,8 @@ def _default_spawn(
     # profile-scoped skills dirs, and preloading a missing skill is
     # fatal at CLI startup. Omitting it is safe — the lifecycle
     # contract still ships via KANBAN_GUIDANCE.
-    if _kanban_worker_skill_available(env.get("HERMES_HOME")):
+    worker_profile_home = profile_home or env.get("HERMES_HOME")
+    if _kanban_worker_skill_available(worker_profile_home):
         cmd.extend(["--skills", "kanban-worker"])
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
@@ -6842,7 +7422,7 @@ def _default_spawn(
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = _resolve_worker_cli_toolsets(worker_profile_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
@@ -6864,7 +7444,11 @@ def _default_spawn(
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=(
+                workspace
+                if isolated_worker
+                else (workspace if os.path.isdir(workspace) else None)
+            ),
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,

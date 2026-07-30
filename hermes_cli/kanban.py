@@ -1863,6 +1863,15 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_env_identity_for(task_id: str) -> tuple[Optional[str], Optional[str]]:
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None, None
+    return (
+        os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+        os.environ.get("HERMES_KANBAN_WORKER_CAPABILITY"),
+    )
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -1894,12 +1903,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            claim_lock, worker_capability = _worker_env_identity_for(tid)
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                expected_claim_lock=claim_lock,
+                expected_worker_capability=worker_capability,
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -1945,11 +1957,14 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+            claim_lock, worker_capability = _worker_env_identity_for(tid)
             if not kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id_for(tid),
+                expected_claim_lock=claim_lock,
+                expected_worker_capability=worker_capability,
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)

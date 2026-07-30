@@ -51,13 +51,36 @@ _DEFAULT_ALLOWED_TOOLS = (
     "Bash(ls *),"
     "Bash(find *),"
     "Bash(grep *),"
-    "Bash(rg *)"
+    "Bash(rg *),"
+    "Bash(clara-clive worker-complete *),"
+    "Bash(clara-clive worker-block *),"
+    "Bash(clara-clse worker-complete *),"
+    "Bash(clara-clse worker-block *)"
 )
 _SECRET_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_API_KEY",
 )
+_KANBAN_SAFE_ENV_KEYS = {
+    "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "TMP", "TEMP",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "COLORTERM",
+    "NO_COLOR", "FORCE_COLOR", "TERM_PROGRAM", "TERM_PROGRAM_VERSION",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "SSL_CERT_FILE",
+    "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy",
+    "https_proxy", "all_proxy", "no_proxy", "PYTHONPATH", "VIRTUAL_ENV",
+    "NVM_DIR", "VOLTA_HOME", "BUN_INSTALL", "GOPATH", "GOROOT", "CARGO_HOME",
+    "RUSTUP_HOME", "JAVA_HOME", "SDKROOT", "DEVELOPER_DIR", "SYSTEMROOT",
+    "WINDIR", "COMSPEC", "PATHEXT", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA",
+    "APPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "USERPROFILE",
+    "NUMBER_OF_PROCESSORS", "AGENT_BROWSER_EXECUTABLE_PATH",
+    "PLAYWRIGHT_BROWSERS_PATH", "CHROME_PATH", "HERMES_HOME", "HERMES_PROFILE",
+    "HERMES_TENANT", "GIT_TERMINAL_PROMPT", "GIT_ASKPASS", "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM", "GIT_SSH_COMMAND", "SSH_ASKPASS",
+    "PYTHONDONTWRITEBYTECODE", "TERMINAL_TIMEOUT",
+    "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+}
 _CLAUDE_SESSION_MAP = "runtime/claude-code-bridge-sessions.json"
 _ENV_DISABLE_RESUME = "HERMES_CLARA_DISABLE_RESUME"
 
@@ -158,7 +181,8 @@ def is_claude_code_cli_config(config: dict[str, Any] | None) -> bool:
 
 # Friendly aliases -> concrete Claude model ids.
 CLARA_MODEL_ALIASES: dict[str, str] = {
-    "opus": "claude-opus-4-8",
+    "opus": "claude-opus-5",
+    "opus-5": "claude-opus-5",
     "opus-4.8": "claude-opus-4-8",
     "fable": "claude-fable-5",
     "fable-5": "claude-fable-5",
@@ -262,11 +286,40 @@ def bridge_config(config: dict[str, Any] | None) -> dict[str, Any]:
             value = config.get(key)
             if isinstance(value, dict):
                 merged.update(value)
-    # Runtime /model-swap override wins over the static config model.
+    role = str(merged.get("role_mode") or merged.get("role") or "")
+    normalized_role = role.strip().casefold().replace("_", "-")
+    is_builder = normalized_role in {"builder", "senior-builder", "clive", "clse"}
+    # Interactive lead/reviewer panes may opt into /model-swap. A named builder
+    # profile remains pinned exclusively by its own config.yaml.
     override = read_clara_model_override()
-    if override:
+    if override and not is_builder:
         merged["model"] = override
     return merged
+
+
+def _bridge_presentation(bcfg: dict[str, Any] | None) -> dict[str, str]:
+    """Return role-aware labels for shared Claude Code bridge UI surfaces."""
+    role = str((bcfg or {}).get("role_mode") or (bcfg or {}).get("role") or "")
+    normalized_role = role.strip().casefold().replace("_", "-")
+    if normalized_role in {"builder", "senior-builder", "clive", "clse"}:
+        return {
+            "actor": "Clive",
+            "progress_marker": "🟧 Clive",
+            "job_prefix": "clive",
+        }
+    return {
+        "actor": "Clara",
+        "progress_marker": "🟪 Clara/클라라",
+        "job_prefix": "clara",
+    }
+
+
+def _new_bridge_job_id(bcfg: dict[str, Any] | None) -> str:
+    presentation = _bridge_presentation(bcfg)
+    return (
+        f"{presentation['job_prefix']}-"
+        f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    )
 
 
 def _expand_path(value: str) -> str:
@@ -290,7 +343,19 @@ def extract_explicit_workdir(message: str) -> str | None:
 
 
 def resolve_workdir(config: dict[str, Any] | None, message: str, hermes_home: Path | None = None) -> str:
-    """Resolve the cwd for Claude Code, preferring explicit prompt/config context."""
+    """Resolve cwd, pinning a dispatched Kanban worker to its task workspace."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        kanban_workspace = os.environ.get("HERMES_KANBAN_WORKSPACE")
+        if not kanban_workspace:
+            raise RuntimeError(
+                "HERMES_KANBAN_WORKSPACE is required for a Kanban worker"
+            )
+        path = Path(_expand_path(kanban_workspace))
+        if path.is_symlink() or not path.is_dir():
+            raise RuntimeError(
+                f"Kanban worker workspace does not exist or is unsafe: {path}"
+            )
+        return str(path.resolve(strict=True))
     explicit = extract_explicit_workdir(message)
     if explicit:
         return explicit
@@ -376,12 +441,13 @@ def _format_failure_result(
     exit_code: int,
     log_dir: Path,
     max_turns: int,
+    actor: str = "Clara",
 ) -> str:
-    """Render a user-facing Clara bridge failure/continuation message."""
+    """Render a user-facing role-aware bridge failure/continuation message."""
     tail = "\n".join((stderr or stdout).splitlines()[-12:]).strip()
     if _is_error_max_turns(parsed, stderr, stdout):
         result_text = (
-            "⏸️ Clara Claude Code CLI 작업이 실패한 것이 아니라 작업 제한(max_turns)에 도달했습니다.\n"
+            f"⏸️ {actor} Claude Code CLI 작업이 실패한 것이 아니라 작업 제한(max_turns)에 도달했습니다.\n"
             "이전 작업 로그/맥락이 남아 있으므로 같은 요청을 이어서 진행할 수 있습니다.\n"
             f"현재 제한: max_turns={max_turns}\n"
             f"job_id: {job_id}\n"
@@ -390,7 +456,7 @@ def _format_failure_result(
         )
     elif _is_quota_or_spend_limit(parsed, stderr, stdout):
         result_text = (
-            "⚠️ Clara Claude Code CLI가 Claude 계정 월 사용 한도에 걸려 실행되지 못했습니다.\n"
+            f"⚠️ {actor} Claude Code CLI가 Claude 계정 월 사용 한도에 걸려 실행되지 못했습니다.\n"
             "Claude 한도를 올리거나 다음 결제 주기까지 기다려야 Claude Code CLI 경로를 다시 사용할 수 있습니다.\n"
             "즉시 작업을 계속하려면 새 Wave pane에서 `hermes-hugo`를 실행해 Hugo/Codex 작업대로 진행하세요.\n"
             f"job_id: {job_id}\n"
@@ -399,7 +465,7 @@ def _format_failure_result(
         )
     elif _is_auth_failed(parsed, stderr, stdout):
         result_text = (
-            "⚠️ Clara Claude Code 인증이 실패했습니다.\n"
+            f"⚠️ {actor} Claude Code 인증이 실패했습니다.\n"
             "Claude Code 로그인 상태는 남아 있지만 API가 401 Invalid authentication credentials를 반환했습니다.\n"
             "해결: `claude auth login` 또는 `claude setup-token`으로 Claude Code 인증을 갱신해야 합니다.\n"
             f"job_id: {job_id}\n"
@@ -408,7 +474,7 @@ def _format_failure_result(
         )
     else:
         result_text = (
-            "⚠️ Clara Claude Code CLI 작업이 실패했습니다.\n"
+            f"⚠️ {actor} Claude Code CLI 작업이 실패했습니다.\n"
             f"job_id: {job_id}\n"
             f"exit_code: {exit_code}\n"
             f"log_dir: {log_dir}\n"
@@ -679,7 +745,9 @@ def build_claude_prompt(
 ) -> str:
     """Build a single Claude Code prompt from gateway context."""
     normalized_role = str(role_mode or "reviewer").strip().casefold().replace("_", "-")
-    if normalized_role in {"lead", "clara-lead", "orchestrator", "coder"}:
+    is_lead = normalized_role in {"lead", "clara-lead", "orchestrator", "coder"}
+    is_builder = normalized_role in {"builder", "senior-builder", "clive", "clse"}
+    if is_lead:
         role_lines = [
             "You are Clara/클라라, Sangkun Lee's lead orchestrator and coding manager.",
             "Clara is the coding orchestrator, not a review-only role.",
@@ -688,6 +756,18 @@ def build_claude_prompt(
             "Operating mode: 2번 clara-lead. In this mode you take Hugo's normal lead role: receive the request, plan, execute, code, verify, coordinate helpers, and report the result.",
             "Use the official Claude Agent SDK subscription runtime as your execution environment. Do not route hermes-claude turns through raw Claude CLI unless Sangkun explicitly approves a fallback.",
             "Symmetry rule: mirror hermes-codex/hugo-lead behavior. Clara is the lead voice, but do not suppress helper/reviewer progress, findings, or evidence; include them as review/test inputs and then give Clara's synthesized conclusion.",
+            "Before editing on a substantial coding request, decide whether there is a clean-repository split with at least one bounded implementation unit for the separate Hermes profile `clive` and non-overlapping Clara-owned work.",
+            "When that safe split exists, write the full Clive brief to a temporary file outside the target repository and automatically run `clara-clive dispatch --task-file <brief>` with exact Clive-owned and Clara-owned relative file paths. Never interpolate task text into shell arguments. Record the returned job/task IDs, then continue Clara-owned work before waiting so the two lanes genuinely overlap.",
+            "Before integration or a completion claim, run `clara-clive wait <job-id> --apply`; this waits for Clive, automatically gates the patch through Coda, and refuses scope, review, or merge conflicts. Run the final project verification after apply.",
+            "Do not simulate dispatch, invent job IDs, use the same file in both lanes, or claim parallel completion from role prose. For a dirty repository, unsafe/overlapping ownership, or a small task, work directly instead of bypassing the fail-closed gate.",
+        ]
+    elif is_builder:
+        role_lines = [
+            "You are Clive, Sangkun Lee's Claude Code Senior Builder under Clara.",
+            "Clara owns product architecture, task decomposition, priority, and integration decisions; execute Clara's or Hugo's scoped implementation briefs without replacing that lead role.",
+            "Inspect the actual repository and instructions, preserve existing user work, make small reviewable code changes, and run the relevant tests, linters, builds, and smoke checks.",
+            "Return changed files, commands and results, assumptions, risks, and handoff notes to Clara.",
+            "Do not act as the independent final reviewer: Coda/Codex owns the separate QA, regression, and security gate, and Hugo verifies the final state.",
         ]
     else:
         role_lines = [
@@ -697,21 +777,38 @@ def build_claude_prompt(
     parts: list[str] = [
         *role_lines,
         "Respond in Korean by default. Be concise, concrete, and action-oriented.",
-        "Operating authority: when you are in clara-lead mode, use the same operational authority Sangkun expects from Hugo: inspect, edit, run commands, coordinate work, and complete the task end-to-end within the user's requested scope.",
+        "Operating authority: in a lead or builder role, inspect, edit, run commands, and complete the assigned local work end-to-end within the user's requested scope.",
         "When working inside the assigned repository, Obsidian vault, project folder, or Hermes profile scope, directly create/edit/patch/refactor/remove local files needed for implementation, review, testing, documentation, and fixes.",
         "If a problem is clear and local file edits are appropriate, make the change yourself, run relevant verification, and report what changed instead of only giving a repair prompt.",
         "Safety boundary inherited from Hugo: preserve user work, do not expose secrets, and keep external side effects such as push/deploy/publish/production writes within the user's requested target and scope.",
     ]
     if workdir:
         parts.append(f"Working directory: {workdir}")
+    if is_builder and os.environ.get("HERMES_KANBAN_TASK"):
+        parts.extend(
+            [
+                "\nKanban worker lifecycle instruction:",
+                "This Clive turn runs through the external Claude Code bridge, where Hermes `kanban_*` model tools are not exposed. Use the file-based coordinator lifecycle; never interpolate handoff text into a shell command.",
+                "After implementation and verification, create `.clara-clive-lifecycle/summary.txt` and `.clara-clive-lifecycle/metadata.json` with the file tools. Metadata must be a JSON object containing changed_files, commands, and tests_run.",
+                "Then run `clara-clive worker-complete --summary-file .clara-clive-lifecycle/summary.txt --metadata-file .clara-clive-lifecycle/metadata.json`.",
+                "If genuinely blocked, write `.clara-clive-lifecycle/reason.txt` and run `clara-clive worker-block --reason-file .clara-clive-lifecycle/reason.txt` instead.",
+                "Do not exit before one lifecycle command succeeds. Do not commit, push, deploy, or modify files outside the task's declared ownership.",
+            ]
+        )
     if channel_prompt:
-        if normalized_role in {"lead", "clara-lead", "orchestrator", "coder"}:
+        if is_lead:
             parts.append(
                 "\nSlack role/channel instruction:\n"
                 "Always start every Slack reply in #office with this exact role marker on the first line: "
                 "'🟪 Clara/클라라 — '. You are Clara/클라라 reporting as the lead orchestrator. "
                 "Do not use the Hugo/휴고 marker in clara-lead mode, even if older channel or history context mentions Hugo. "
                 "Post as Clara lead, but keep parity with hermes-codex: include helper/reviewer findings as evidence when they are relevant, then provide Clara's synthesized conclusion."
+            )
+        elif is_builder:
+            parts.append(
+                "\nSlack role/channel instruction:\n"
+                + str(channel_prompt)
+                + "\nIdentify as Clive, Claude Code Senior Builder under Clara; do not present yourself as Clara, Coda, or Hugo."
             )
         else:
             parts.append("\nSlack role/channel instruction:\n" + str(channel_prompt))
@@ -738,8 +835,9 @@ def build_claude_prompt(
         request_text = "(사용자가 텍스트 없이 이미지/첨부만 보냈습니다.)"
     parts.append("\nCurrent user request:\n" + request_text)
     if channel_prompt:
+        actor = "Clive" if is_builder else "Clara"
         parts.append(
-            "\nReturn a Slack-ready Clara response. Include what you checked, findings, verification, and next action."
+            f"\nReturn a Slack-ready {actor} response. Include what you checked, findings, verification, and next action."
         )
     else:
         parts.append(
@@ -775,7 +873,9 @@ def _format_compact_tokens(count: int) -> str:
     return f"{round(count / 1000)}K"
 
 
-def format_token_usage_line(parsed: dict[str, Any] | None) -> str:
+def format_token_usage_line(
+    parsed: dict[str, Any] | None, *, actor: str = "Clara"
+) -> str:
     """Render a statusline-style context usage line from Claude CLI result JSON.
 
     Mirrors the local statusline format, e.g.
@@ -816,17 +916,53 @@ def format_token_usage_line(parsed: dict[str, Any] | None) -> str:
     # The redundant bar+% graphic is intentionally omitted so the footer never
     # shows two context indicators that look like conflicting readings.
     return (
-        f"⚕ Clara {short_model} │ "
+        f"⚕ {actor} {short_model} │ "
         f"{_format_compact_tokens(used)}/{_format_compact_tokens(window)}"
     )
 
 
 def _safe_env() -> dict[str, str]:
     env = dict(os.environ)
+    if env.get("HERMES_KANBAN_TASK"):
+        env = {
+            key: value
+            for key, value in env.items()
+            if (
+                key in _KANBAN_SAFE_ENV_KEYS
+                or key.startswith("LC_")
+                or key.startswith("HERMES_KANBAN_")
+            )
+        }
     # Force Claude Code to use its logged-in account/keychain path rather than
     # accidentally taking a process-level Anthropic API key and billing the API.
     for key in _SECRET_ENV_KEYS:
         env.pop(key, None)
+    if env.get("HERMES_KANBAN_TASK"):
+        allowed_hermes = {"HERMES_HOME", "HERMES_PROFILE", "HERMES_TENANT"}
+        exact_sensitive = {
+            "DATABASE_URL", "DOCKER_AUTH_CONFIG", "DOCKER_CONFIG",
+            "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "SSH_AUTH_SOCK",
+            "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
+        }
+        sensitive_prefixes = (
+            "AWS_", "AZURE_", "GCP_", "GOOGLE_CLOUD_", "GH_", "GITHUB_",
+            "SLACK_", "DISCORD_", "TELEGRAM_",
+        )
+        sensitive_suffixes = (
+            "_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS",
+        )
+        for key in list(env):
+            upper = key.upper()
+            if upper.startswith("HERMES_") and not (
+                key in allowed_hermes or upper.startswith("HERMES_KANBAN_")
+            ):
+                env.pop(key, None)
+            elif (
+                key in exact_sensitive
+                or upper.startswith(sensitive_prefixes)
+                or upper.endswith(sensitive_suffixes)
+            ):
+                env.pop(key, None)
     return env
 
 
@@ -846,6 +982,7 @@ def _run_claude_subprocess(
     timeout: int,
     job_id: str,
     progress_interval: int,
+    progress_marker: str = "🟪 Clara/클라라",
     cancel_event: Any | None = None,
     progress_callback: Any | None = None,
 ) -> tuple[str, str, int]:
@@ -860,7 +997,11 @@ def _run_claude_subprocess(
     next_progress = started + interval if interval else float("inf")
     if progress_callback is not None:
         try:
-            progress_callback("bridge.spawned", f"Claude Code CLI 프로세스 시작: job {job_id}", {"job_id": job_id})
+            progress_callback(
+                "bridge.spawned",
+                f"Claude Code CLI 프로세스 시작: job {job_id}",
+                {"job_id": job_id, "progress_marker": progress_marker},
+            )
         except Exception:
             pass
     proc = subprocess.Popen(
@@ -882,7 +1023,11 @@ def _run_claude_subprocess(
             stderr = (stderr or "") + "\nClaude Code CLI interrupted by user."
             if progress_callback is not None:
                 try:
-                    progress_callback("bridge.interrupted", "Claude Code CLI 작업을 중단했습니다.", {"job_id": job_id})
+                    progress_callback(
+                        "bridge.interrupted",
+                        "Claude Code CLI 작업을 중단했습니다.",
+                        {"job_id": job_id, "progress_marker": progress_marker},
+                    )
                 except Exception:
                     pass
             return stdout or "", stderr, 130
@@ -894,7 +1039,11 @@ def _run_claude_subprocess(
             stderr = (stderr or "") + f"\nClaude Code CLI timed out after {timeout}s."
             if progress_callback is not None:
                 try:
-                    progress_callback("bridge.timeout", f"Claude Code CLI가 {timeout}s 제한에 도달했습니다.", {"job_id": job_id})
+                    progress_callback(
+                        "bridge.timeout",
+                        f"Claude Code CLI가 {timeout}s 제한에 도달했습니다.",
+                        {"job_id": job_id, "progress_marker": progress_marker},
+                    )
                 except Exception:
                     pass
             return stdout or "", stderr, 124
@@ -908,7 +1057,11 @@ def _run_claude_subprocess(
                     progress_callback(
                         "bridge.completed",
                         f"Claude Code CLI 프로세스 종료: exit {int(proc.returncode or 0)}",
-                        {"job_id": job_id, "elapsed_seconds": round(time.time() - started, 1)},
+                        {
+                            "job_id": job_id,
+                            "elapsed_seconds": round(time.time() - started, 1),
+                            "progress_marker": progress_marker,
+                        },
                     )
                 except Exception:
                     pass
@@ -917,10 +1070,18 @@ def _run_claude_subprocess(
             if interval and time.time() >= next_progress:
                 elapsed = int(time.time() - started)
                 message = f"Claude Code CLI 실행 중… {elapsed}s elapsed, job {job_id}"
-                _emit_progress(f"🟪 Clara/클라라 — {message}")
+                _emit_progress(f"{progress_marker} — {message}")
                 if progress_callback is not None:
                     try:
-                        progress_callback("heartbeat", message, {"job_id": job_id, "elapsed_seconds": elapsed})
+                        progress_callback(
+                            "heartbeat",
+                            message,
+                            {
+                                "job_id": job_id,
+                                "elapsed_seconds": elapsed,
+                                "progress_marker": progress_marker,
+                            },
+                        )
                     except Exception:
                         pass
                 next_progress = time.time() + interval
@@ -1104,7 +1265,7 @@ def run_claude_code_bridge_sync(
         message=message,
         workdir=workdir,
     )
-    job_id = f"clara-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    job_id = _new_bridge_job_id(bcfg)
     log_dir = hermes_home / "clara-jobs" / job_id
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1124,6 +1285,8 @@ def run_claude_code_bridge_sync(
         "workdir": workdir,
         "created_at": time.time(),
         "provider": "claude-code-cli",
+        "model": model or "default",
+        "effort": effort or "default",
         "max_turns": max_turns,
         "allowed_tools": allowed_tools or "default",
         "timeout_seconds": timeout,
@@ -1171,6 +1334,7 @@ def run_claude_code_bridge_sync(
             timeout=timeout,
             job_id=job_id,
             progress_interval=progress_interval,
+            progress_marker=_bridge_presentation(bcfg)["progress_marker"],
             cancel_event=cancel_event,
             progress_callback=progress_callback,
         )
@@ -1213,21 +1377,20 @@ def run_claude_code_bridge_sync(
             exit_code=exit_code,
             log_dir=log_dir,
             max_turns=max_turns,
+            actor=_bridge_presentation(bcfg)["actor"],
         )
 
-    prefix = str(bcfg.get("response_prefix") or "🟪 Clara/클라라 — ")
-    if prefix:
-        # The model may emit the marker itself with trailing newline/space
-        # variants; strip every leading occurrence, then prepend exactly one.
-        marker = prefix.strip()
-        body = result_text.lstrip()
-        while marker and body.startswith(marker):
-            body = body[len(marker):].lstrip()
-        result_text = prefix + body
+    result_text = _apply_bridge_response_prefix(
+        result_text,
+        bcfg,
+        channel_prompt=channel_prompt,
+    )
     if bool(bcfg.get("show_job_footer", False)):
         result_text += f"\n\n_Claude Code CLI job: {job_id}_"
     if bool(bcfg.get("show_token_usage_footer", False)):
-        usage_line = format_token_usage_line(parsed)
+        usage_line = format_token_usage_line(
+            parsed, actor=_bridge_presentation(bcfg)["actor"]
+        )
         if usage_line:
             result_text += f"\n_{usage_line}_"
 
@@ -1248,6 +1411,34 @@ def run_claude_code_bridge_sync(
     )
 
 
+def _apply_bridge_response_prefix(
+    result_text: str,
+    bcfg: dict[str, Any],
+    *,
+    channel_prompt: str | None,
+) -> str:
+    """Apply the role marker without displacing the CLI learning-mode block."""
+    configured_prefix = bcfg.get("response_prefix")
+    prefix = (
+        f"{_bridge_presentation(bcfg)['progress_marker']} — "
+        if configured_prefix is None
+        else str(configured_prefix)
+    )
+    if not prefix:
+        return result_text
+
+    body = result_text.lstrip()
+    if not channel_prompt and body.startswith("**Refined English Prompt**"):
+        return body
+
+    # The model may emit the marker itself with trailing newline/space
+    # variants; strip every leading occurrence, then prepend exactly one.
+    marker = prefix.strip()
+    while marker and body.startswith(marker):
+        body = body[len(marker):].lstrip()
+    return prefix + body
+
+
 def _format_bridge_result_text(
     *,
     parsed: dict[str, Any] | None,
@@ -1256,6 +1447,7 @@ def _format_bridge_result_text(
     log_dir: Path,
     max_turns: int,
     bcfg: dict[str, Any],
+    channel_prompt: str | None = None,
     stderr: str = "",
     stdout: str = "",
 ) -> str:
@@ -1273,18 +1465,19 @@ def _format_bridge_result_text(
             exit_code=exit_code,
             log_dir=log_dir,
             max_turns=max_turns,
+            actor=_bridge_presentation(bcfg)["actor"],
         )
-    prefix = str(bcfg.get("response_prefix") or "🟪 Clara/클라라 — ")
-    if prefix:
-        marker = prefix.strip()
-        body = result_text.lstrip()
-        while marker and body.startswith(marker):
-            body = body[len(marker):].lstrip()
-        result_text = prefix + body
+    result_text = _apply_bridge_response_prefix(
+        result_text,
+        bcfg,
+        channel_prompt=channel_prompt,
+    )
     if bool(bcfg.get("show_job_footer", False)):
         result_text += f"\n\n_Claude Code CLI job: {job_id}_"
     if bool(bcfg.get("show_token_usage_footer", False)):
-        usage_line = format_token_usage_line(parsed)
+        usage_line = format_token_usage_line(
+            parsed, actor=_bridge_presentation(bcfg)["actor"]
+        )
         if usage_line:
             result_text += f"\n_{usage_line}_"
     return result_text
@@ -1342,6 +1535,18 @@ def run_claude_code_bridge_resident(
             role_mode = "clara-lead" if read_mode(hermes_home).get("mode") == MODE_CLARA_LEAD else "reviewer"
         except Exception:
             role_mode = "reviewer"
+    runtime_bcfg = {**bcfg, "role_mode": role_mode}
+    presentation = _bridge_presentation(runtime_bcfg)
+    actor = presentation["actor"]
+    progress_marker = presentation["progress_marker"]
+
+    def role_progress_callback(event_type, text, data=None):
+        if progress_callback is None:
+            return
+        payload = dict(data) if isinstance(data, dict) else {}
+        payload.setdefault("progress_marker", progress_marker)
+        progress_callback(event_type, text, payload)
+
     role_is_lead = role_mode.strip().casefold().replace("_", "-") in {"lead", "clara-lead", "orchestrator", "coder"}
     if configured_allowed_tools:
         allowed_tools = str(configured_allowed_tools)
@@ -1373,7 +1578,7 @@ def run_claude_code_bridge_resident(
         message=message,
         workdir=workdir,
     )
-    job_id = f"clara-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    job_id = _new_bridge_job_id(bcfg)
     log_dir = hermes_home / "clara-jobs" / job_id
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1416,6 +1621,8 @@ def run_claude_code_bridge_resident(
         "created_at": time.time(),
         "provider": "claude-code-cli",
         "delivery": "resident",
+        "model": model or "default",
+        "effort": effort or "default",
         "max_turns": max_turns,
         "sdk_max_buffer_size": _as_int(bcfg.get("sdk_max_buffer_size"), 8 * 1024 * 1024),
         "allowed_tools": allowed_tools or "default",
@@ -1454,7 +1661,9 @@ def run_claude_code_bridge_resident(
                 max_buffer_size=metadata["sdk_max_buffer_size"],
                 strict_mcp_config=_as_bool(bcfg.get("strict_mcp"), False),
                 log_dir=log_dir,
-                progress_callback=progress_callback,
+                progress_callback=(
+                    role_progress_callback if progress_callback is not None else None
+                ),
             )
             parsed["provider"] = "claude-code-cli"
             parsed["delivery"] = "agent-sdk"
@@ -1478,7 +1687,8 @@ def run_claude_code_bridge_resident(
                 job_id=job_id,
                 log_dir=log_dir,
                 max_turns=max_turns,
-                bcfg=bcfg,
+                bcfg=runtime_bcfg,
+                channel_prompt=channel_prompt,
             )
             _write_bridge_ledger(
                 hermes_home=hermes_home,
@@ -1505,19 +1715,41 @@ def run_claude_code_bridge_resident(
                     exit_code=1,
                     log_dir=log_dir,
                     max_turns=max_turns,
+                    actor=actor,
                 )
+                progress_event_type = "sdk.error"
+                progress_text = "Claude Agent SDK 작업 제한(max_turns)에 도달했습니다. CLI fallback은 실행하지 않았습니다."
+                raw_subtype = "error"
+            elif "claude agent sdk timed out after" in error_detail.casefold():
+                error_text = (
+                    f"⏸️ {actor} Claude Agent SDK 작업이 SDK 경로 장애가 아니라 "
+                    "실행 시간 제한(timeout_seconds)에 도달해 중단되었습니다.\n"
+                    "부분 작업과 SDK 이벤트 로그가 남아 있으므로 같은 요청을 이어서 진행할 수 있습니다.\n"
+                    "Sangkun 지시에 따라 Claude CLI fallback은 자동 실행하지 않았습니다.\n"
+                    f"현재 제한: timeout_seconds={timeout}\n"
+                    f"job_id: {job_id}\n"
+                    f"log_dir: {log_dir}\n"
+                )
+                progress_event_type = "sdk.timeout"
+                progress_text = "Claude Agent SDK 작업이 실행 시간 제한에 도달했습니다. CLI fallback은 실행하지 않았습니다."
+                raw_subtype = "timeout"
             else:
                 error_text = (
-                    "⚠️ Clara Claude Agent SDK 경로가 실패했습니다.\n"
+                    f"⚠️ {actor} Claude Agent SDK 경로가 실패했습니다.\n"
                     "현재 hermes-claude는 Sangkun 지시에 따라 Claude CLI fallback을 자동 실행하지 않습니다.\n"
                     f"오류: {error_detail}\n"
                     f"job_id: {job_id}\n"
                     f"log_dir: {log_dir}\n"
                 )
+                progress_event_type = "sdk.error"
+                progress_text = "Claude Agent SDK 경로가 실패했습니다. CLI fallback은 실행하지 않았습니다."
+                raw_subtype = "error"
             (log_dir / "sdk-error.log").write_text(error_text, encoding="utf-8")
             if progress_callback is not None:
                 try:
-                    progress_callback("sdk.error", "Claude Agent SDK 경로가 실패했습니다. CLI fallback은 실행하지 않았습니다.", {"job_id": job_id})
+                    role_progress_callback(
+                        progress_event_type, progress_text, {"job_id": job_id}
+                    )
                 except Exception:
                     pass
             return ClaudeCodeBridgeResult(
@@ -1526,7 +1758,12 @@ def run_claude_code_bridge_resident(
                 workdir=workdir,
                 log_dir=str(log_dir),
                 exit_code=1,
-                raw_json={"delivery": "agent-sdk", "is_error": True, "error": str(sdk_exc)},
+                raw_json={
+                    "delivery": "agent-sdk",
+                    "subtype": raw_subtype,
+                    "is_error": True,
+                    "error": str(sdk_exc),
+                },
             )
 
     from gateway.claude_resident import get_pool, ResidentTurnError
@@ -1534,7 +1771,11 @@ def run_claude_code_bridge_resident(
     pool = get_pool(idle_timeout=idle_timeout, max_processes=max_processes)
     if progress_callback is not None:
         try:
-            progress_callback("resident.started", f"Claude Code resident 런타임 실행: job {job_id}", {"job_id": job_id})
+            role_progress_callback(
+                "resident.started",
+                f"Claude Code resident 런타임 실행: job {job_id}",
+                {"job_id": job_id},
+            )
         except Exception:
             pass
     parsed: dict[str, Any] | None = None
@@ -1607,7 +1848,11 @@ def run_claude_code_bridge_resident(
         mark_clara_handoff_done()
     if progress_callback is not None:
         try:
-            progress_callback("resident.completed", f"Claude Code resident 작업 종료: exit {exit_code}", {"job_id": job_id})
+            role_progress_callback(
+                "resident.completed",
+                f"Claude Code resident 작업 종료: exit {exit_code}",
+                {"job_id": job_id},
+            )
         except Exception:
             pass
     result_text = _format_bridge_result_text(
@@ -1616,7 +1861,8 @@ def run_claude_code_bridge_resident(
         job_id=job_id,
         log_dir=log_dir,
         max_turns=max_turns,
-        bcfg=bcfg,
+        bcfg=runtime_bcfg,
+        channel_prompt=channel_prompt,
     )
 
     _write_bridge_ledger(

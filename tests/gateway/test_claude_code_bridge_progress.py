@@ -227,6 +227,93 @@ def test_sdk_max_turn_exception_renders_as_continuation_not_generic_failure(monk
     assert "SDK 경로가 실패" not in result.final_response
 
 
+def test_sdk_timeout_renders_as_continuation_not_generic_failure(monkeypatch, tmp_path):
+    def boom(**_kwargs):
+        raise Exception("Claude Agent SDK timed out after 3600s")
+
+    monkeypatch.setattr("gateway.claude_agent_sdk_bridge.run_sdk_turn", boom)
+    events = []
+    result = run_claude_code_bridge_resident(
+        config={
+            "clara_cli": {
+                "sdk_enabled": True,
+                "resident_enabled": True,
+                "command": "claude",
+                "timeout_seconds": 3600,
+            }
+        },
+        message="hi",
+        context_prompt=None,
+        channel_prompt=None,
+        history=[],
+        hermes_home=tmp_path,
+        bridge_session_key="cli:test",
+        progress_callback=lambda event_type, text, data=None: events.append(
+            (event_type, text, data or {})
+        ),
+    )
+
+    assert result.exit_code == 1
+    assert "SDK 경로 장애가 아니라 실행 시간 제한(timeout_seconds)에 도달" in result.final_response
+    assert "현재 제한: timeout_seconds=3600" in result.final_response
+    assert "같은 요청을 이어서 진행" in result.final_response
+    assert "SDK 경로가 실패" not in result.final_response
+    assert result.raw_json["subtype"] == "timeout"
+    assert events[-1][0] == "sdk.timeout"
+
+
+def test_sdk_bridge_keeps_refined_prompt_first_in_cli(monkeypatch, tmp_path):
+    refined = (
+        "**Refined English Prompt**\n"
+        "```text\n"
+        "Explain recursion in exactly 3 lines.\n"
+        "```\n\n"
+        "재귀 설명"
+    )
+
+    def fake_run_sdk_turn(**_kwargs):
+        return {"type": "result", "subtype": "success", "is_error": False, "result": refined}
+
+    monkeypatch.setattr("gateway.claude_agent_sdk_bridge.run_sdk_turn", fake_run_sdk_turn)
+    result = run_claude_code_bridge_resident(
+        config={"clara_cli": {"sdk_enabled": True, "resident_enabled": True, "command": "claude"}},
+        message="재귀를 설명해줘",
+        context_prompt=None,
+        channel_prompt=None,
+        history=[],
+        hermes_home=tmp_path,
+        bridge_session_key="cli:refined-prompt",
+    )
+
+    assert result.final_response == refined
+
+
+def test_sdk_bridge_keeps_role_prefix_for_slack_refined_prompt(monkeypatch, tmp_path):
+    refined = (
+        "**Refined English Prompt**\n"
+        "```text\n"
+        "Explain recursion in exactly 3 lines.\n"
+        "```\n\n"
+        "재귀 설명"
+    )
+
+    def fake_run_sdk_turn(**_kwargs):
+        return {"type": "result", "subtype": "success", "is_error": False, "result": refined}
+
+    monkeypatch.setattr("gateway.claude_agent_sdk_bridge.run_sdk_turn", fake_run_sdk_turn)
+    result = run_claude_code_bridge_resident(
+        config={"clara_cli": {"sdk_enabled": True, "resident_enabled": True, "command": "claude"}},
+        message="재귀를 설명해줘",
+        context_prompt=None,
+        channel_prompt="Slack #office",
+        history=[],
+        hermes_home=tmp_path,
+        bridge_session_key="slack:refined-prompt",
+    )
+
+    assert result.final_response.startswith("🟪 Clara/클라라 — **Refined English Prompt**")
+
+
 def test_sdk_bridge_passes_buffer_and_strict_mcp_config(monkeypatch, tmp_path):
     captured = {}
 
@@ -259,7 +346,10 @@ def test_sdk_bridge_passes_buffer_and_strict_mcp_config(monkeypatch, tmp_path):
 
 
 def test_sdk_bridge_records_buffer_limit_in_metadata(monkeypatch, tmp_path):
+    events = []
+
     def fake_run_sdk_turn(**kwargs):
+        kwargs["progress_callback"]("sdk.stream_event", "working", {})
         return {"type": "result", "subtype": "success", "is_error": False, "result": "ok"}
 
     monkeypatch.setattr("gateway.claude_agent_sdk_bridge.run_sdk_turn", fake_run_sdk_turn)
@@ -270,6 +360,9 @@ def test_sdk_bridge_records_buffer_limit_in_metadata(monkeypatch, tmp_path):
                 "resident_enabled": True,
                 "command": "claude",
                 "sdk_max_buffer_size": 16777216,
+                "model": "claude-opus-5",
+                "sdk_effort": "max",
+                "role_mode": "senior-builder",
             }
         },
         message="hi",
@@ -278,10 +371,17 @@ def test_sdk_bridge_records_buffer_limit_in_metadata(monkeypatch, tmp_path):
         history=[],
         hermes_home=tmp_path,
         bridge_session_key="cli:test",
+        progress_callback=lambda event_type, text, data=None: events.append(
+            (event_type, text, data or {})
+        ),
     )
 
     metadata = (Path(result.log_dir) / "metadata.json").read_text(encoding="utf-8")
     assert '\"sdk_max_buffer_size\": 16777216' in metadata
+    assert '\"model\": \"claude-opus-5\"' in metadata
+    assert '\"effort\": \"max\"' in metadata
+    assert events[0][2]["progress_marker"] == "🟧 Clive"
+    assert result.final_response == "🟧 Clive — ok"
 
 
 def test_sdk_bridge_raises_transport_default_buffer_limit(monkeypatch):

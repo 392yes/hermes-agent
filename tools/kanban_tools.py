@@ -116,6 +116,16 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_env_identity(task_id: str) -> tuple[Optional[str], Optional[str]]:
+    """Return dispatcher claim/capability values only for this worker's task."""
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None, None
+    return (
+        os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+        os.environ.get("HERMES_KANBAN_WORKER_CAPABILITY"),
+    )
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -555,11 +565,14 @@ def _handle_complete(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             try:
+                claim_lock, worker_capability = _worker_env_identity(tid)
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    expected_claim_lock=claim_lock,
+                    expected_worker_capability=worker_capability,
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -613,10 +626,13 @@ def _handle_block(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            claim_lock, worker_capability = _worker_env_identity(tid)
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
+                expected_claim_lock=claim_lock,
+                expected_worker_capability=worker_capability,
             )
             if not ok:
                 return tool_error(

@@ -4974,7 +4974,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             label = "done"
         if len(msg) > 110:
             msg = msg[:107] + "..."
-        _cprint(f"  ┊ 🟪 {label:<5} {msg}")
+        marker = str((data or {}).get("progress_marker") or "🟪").split()[0]
+        _cprint(f"  ┊ {marker} {label:<5} {msg}")
 
     def _print_claude_tool_progress_line(self, phase: str, tool_name: str, args: dict, preview: str = "", *, duration: float = 0.0, result=None) -> None:
         """Print one compact Hermes-style line for Claude SDK tool activity."""
@@ -10889,6 +10890,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             try:
                                 event_type = str(_event_type or "progress")
                                 data = _data if isinstance(_data, dict) else {}
+                                progress_marker = str(
+                                    data.get("progress_marker") or "🟪"
+                                ).split()[0]
 
                                 # Claude Agent SDK path: mirror SDK AssistantMessage
                                 # text into Hermes' native streaming box, and map
@@ -10930,7 +10934,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                                     )
                                     return
                                 if event_type in {"sdk.tool.started", "sdk.tool.completed"}:
-                                    self._spinner_text = f"🟪 {text}"
+                                    self._spinner_text = f"{progress_marker} {text}"
                                     self._tool_start_time = 0.0
                                     self._invalidate()
                                     return
@@ -10938,12 +10942,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                                     # Low-level SDK heartbeat: useful for the
                                     # footer, too noisy for scrollback and can
                                     # land inside an open response box.
-                                    self._spinner_text = f"🟪 {text}"
+                                    self._spinner_text = f"{progress_marker} {text}"
                                     self._tool_start_time = 0.0
                                     self._invalidate()
                                     return
 
-                                self._spinner_text = f"🟪 {text}"
+                                self._spinner_text = f"{progress_marker} {text}"
                                 self._tool_start_time = 0.0
                                 if not getattr(self, "_stream_box_opened", False):
                                     self._print_claude_bridge_status_line(event_type, str(text or ""), data)
