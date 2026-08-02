@@ -2747,7 +2747,7 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     hint = failed_api_key or None
 
     if _is_auth_error(exc):
-        refreshed = pool.try_refresh_current()
+        refreshed = pool.try_refresh_current(api_key_hint=hint)
         if refreshed is not None:
             _evict_cached_clients(normalized)
             return True

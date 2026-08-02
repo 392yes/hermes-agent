@@ -662,7 +662,7 @@ def test_recover_with_credential_pool_still_refreshes_genuine_auth_failure():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_current(self, api_key_hint=None):
             refresh_calls["n"] += 1
             # Return a fake refreshed entry — semantically "refresh worked"
             entry = MagicMock()
@@ -843,7 +843,7 @@ def test_recover_with_credential_pool_refreshes_on_xai_bad_credentials_403():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_current(self, api_key_hint=None):
             refresh_calls["n"] += 1
             entry = MagicMock()
             entry.id = "entry_refreshed_after_stale"

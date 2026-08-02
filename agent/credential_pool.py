@@ -1465,12 +1465,28 @@ class CredentialPool:
             else:
                 self._active_leases[credential_id] = count - 1
 
-    def try_refresh_current(self) -> Optional[PooledCredential]:
+    def try_refresh_current(self, api_key_hint: Optional[str] = None) -> Optional[PooledCredential]:
         with self._lock:
-            return self._try_refresh_current_unlocked()
+            return self._try_refresh_current_unlocked(api_key_hint=api_key_hint)
 
-    def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
-        entry = self.current()
+    def _try_refresh_current_unlocked(self, api_key_hint: Optional[str] = None) -> Optional[PooledCredential]:
+        entry = None
+        if api_key_hint:
+            # Prefer the entry whose runtime key actually failed. current() is
+            # None whenever this pool was freshly loaded from disk or a prior
+            # mark_exhausted_and_rotate() reset it — without this hint the 401
+            # auth-recovery path silently skipped token refresh and exhausted
+            # the entry instead (2026-08-02 token_expired outage). Mirrors the
+            # api_key_hint fallback in mark_exhausted_and_rotate().
+            entry = next(
+                (e for e in self._entries if e.runtime_api_key == api_key_hint),
+                None,
+            )
+        if entry is None:
+            entry = self.current()
+        if entry is None and len(self._entries) == 1:
+            # Single-entry pool: unambiguous even without hint/current.
+            entry = self._entries[0]
         if entry is None:
             return None
         refreshed = self._refresh_entry(entry, force=True)

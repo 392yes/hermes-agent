@@ -773,7 +773,8 @@ def recover_with_credential_pool(
                 agent.provider or "provider",
             )
             return False, has_retried_429
-        refreshed = pool.try_refresh_current()
+        _auth_api_key_hint = str(getattr(agent, "api_key", "") or "").strip() or None
+        refreshed = pool.try_refresh_current(api_key_hint=_auth_api_key_hint)
         if refreshed is not None:
             _ra().logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
             agent._swap_credential(refreshed)
@@ -781,7 +782,7 @@ def recover_with_credential_pool(
         # Refresh failed — rotate to next credential instead of giving up.
         # The failed entry is already marked exhausted by try_refresh_current().
         rotate_status = status_code if status_code is not None else 401
-        next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+        next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context, api_key_hint=_auth_api_key_hint)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (auth refresh failed) — rotated to pool entry %s",

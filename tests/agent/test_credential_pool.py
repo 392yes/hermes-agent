@@ -2998,3 +2998,229 @@ def test_codex_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypat
     tokens = auth_payload["providers"]["openai-codex"].get("tokens", {})
     assert tokens.get("access_token") == "old-access-token"
     assert tokens.get("refresh_token") == "old-refresh-token"
+
+
+# ---------------------------------------------------------------------------
+# try_refresh_current(api_key_hint=...) — 2026-08-02 codex token_expired outage
+#
+# ``_try_refresh_current_unlocked`` used only ``current()``.  ``_current_id`` is
+# None whenever the pool was freshly loaded from disk or a previous
+# ``mark_exhausted_and_rotate`` reset it, so the 401 auth-recovery path returned
+# instantly, NEVER attempted a token refresh, marked the only entry exhausted
+# and aborted the turn with "401 token_expired".  ``mark_exhausted_and_rotate``
+# already solved the same staleness with an ``api_key_hint`` fallback.
+# ---------------------------------------------------------------------------
+
+
+def _codex_oauth_entry(entry_id: str, access_token: str, priority: int) -> dict:
+    return {
+        "id": entry_id,
+        "label": entry_id,
+        "auth_type": "oauth",
+        "priority": priority,
+        "source": "manual:device_code",
+        "access_token": access_token,
+        "refresh_token": f"refresh-{entry_id}",
+    }
+
+
+def _load_codex_oauth_pool(tmp_path, monkeypatch, entries: list):
+    """Load an openai-codex pool from disk with host auto-seeding disabled."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
+    # Prevent auto-seeding from Codex CLI tokens on the host
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    _write_auth_store(
+        tmp_path,
+        {"version": 1, "credential_pool": {"openai-codex": entries}},
+    )
+
+    from agent.credential_pool import load_pool
+
+    return load_pool("openai-codex")
+
+
+def test_try_refresh_current_uses_api_key_hint_when_current_is_none(tmp_path, monkeypatch):
+    """The failing runtime key must select the entry to refresh."""
+    from dataclasses import replace
+
+    pool = _load_codex_oauth_pool(
+        tmp_path, monkeypatch, [_codex_oauth_entry("cred-a", "access-token-A", 0)]
+    )
+
+    assert pool.current() is None, "precondition: freshly loaded pool has no current entry"
+    entries = pool.entries()
+    assert len(entries) == 1
+    target = entries[0]
+    assert target.runtime_api_key == "access-token-A"
+
+    refreshed_entry = replace(target, access_token="access-token-A-REFRESHED")
+    refresh_calls = []
+
+    def _fake_refresh(entry, *, force):
+        refresh_calls.append((entry.id, force))
+        return refreshed_entry
+
+    monkeypatch.setattr(pool, "_refresh_entry", _fake_refresh)
+
+    result = pool.try_refresh_current(api_key_hint="access-token-A")
+
+    assert result is refreshed_entry
+    assert refresh_calls == [("cred-a", True)]
+    assert pool._current_id == refreshed_entry.id
+
+
+def test_try_refresh_current_without_hint_falls_back_to_single_entry(tmp_path, monkeypatch):
+    """Callers that pass no hint still refresh an unambiguous single-entry pool."""
+    from dataclasses import replace
+
+    pool = _load_codex_oauth_pool(
+        tmp_path, monkeypatch, [_codex_oauth_entry("cred-a", "access-token-A", 0)]
+    )
+
+    assert pool.current() is None
+    target = pool.entries()[0]
+
+    refreshed_entry = replace(target, access_token="access-token-A-REFRESHED")
+    refresh_calls = []
+
+    def _fake_refresh(entry, *, force):
+        refresh_calls.append((entry.id, force))
+        return refreshed_entry
+
+    monkeypatch.setattr(pool, "_refresh_entry", _fake_refresh)
+
+    result = pool.try_refresh_current()
+
+    assert result is refreshed_entry
+    assert refresh_calls == [("cred-a", True)]
+    assert pool._current_id == refreshed_entry.id
+
+
+def test_try_refresh_current_multi_entry_unmatched_hint_refreshes_nothing(tmp_path, monkeypatch):
+    """Never refresh an arbitrary other account's entry.
+
+    With more than one entry, no current selection and a hint that matches
+    none of them, the correct target is unknowable — refuse instead of
+    guessing.
+    """
+    pool = _load_codex_oauth_pool(
+        tmp_path,
+        monkeypatch,
+        [
+            _codex_oauth_entry("cred-a", "access-token-A", 0),
+            _codex_oauth_entry("cred-b", "access-token-B", 1),
+        ],
+    )
+
+    assert pool.current() is None
+    assert len(pool.entries()) == 2
+
+    refresh_calls = []
+
+    def _fake_refresh(entry, *, force):
+        refresh_calls.append((entry.id, force))
+        raise AssertionError("_refresh_entry must not run for an unmatched hint")
+
+    monkeypatch.setattr(pool, "_refresh_entry", _fake_refresh)
+
+    assert pool.try_refresh_current(api_key_hint="access-token-UNKNOWN") is None
+    assert refresh_calls == []
+
+
+def _auth_recovery_agent(pool):
+    """Minimal agent double for ``recover_with_credential_pool``'s auth path."""
+    from unittest.mock import MagicMock
+
+    agent = MagicMock()
+    agent.provider = "openai-codex"
+    agent.api_key = "access-token-A"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent._credential_pool = pool
+    agent._is_entitlement_failure = MagicMock(return_value=False)
+    agent._swap_credential = MagicMock()
+    return agent
+
+
+def test_recover_with_credential_pool_passes_api_key_hint_to_refresh():
+    """The 401 auth path must tell the pool WHICH runtime key failed."""
+    from types import SimpleNamespace
+
+    from agent.agent_runtime_helpers import recover_with_credential_pool
+    from agent.error_classifier import FailoverReason
+
+    refreshed_entry = SimpleNamespace(id="entry-refreshed")
+
+    class _FakePool:
+        provider = "openai-codex"
+
+        def __init__(self):
+            self.refresh_hints = []
+
+        def try_refresh_current(self, api_key_hint=None):
+            self.refresh_hints.append(api_key_hint)
+            return refreshed_entry
+
+        def mark_exhausted_and_rotate(self, **kwargs):
+            raise AssertionError("must not rotate when refresh succeeds")
+
+    pool = _FakePool()
+    agent = _auth_recovery_agent(pool)
+
+    recovered, has_retried_429 = recover_with_credential_pool(
+        agent,
+        status_code=401,
+        has_retried_429=False,
+        classified_reason=FailoverReason.auth,
+        error_context={"message": "token_expired", "reason": "unauthorized"},
+    )
+
+    assert recovered is True
+    assert has_retried_429 is False
+    assert pool.refresh_hints == ["access-token-A"]
+    agent._swap_credential.assert_called_once_with(refreshed_entry)
+
+
+def test_recover_with_credential_pool_passes_api_key_hint_to_rotate():
+    """When refresh fails, the rotate call must mark the SAME failing entry."""
+    from types import SimpleNamespace
+
+    from agent.agent_runtime_helpers import recover_with_credential_pool
+    from agent.error_classifier import FailoverReason
+
+    next_entry = SimpleNamespace(id="entry-next")
+
+    class _FakePool:
+        provider = "openai-codex"
+
+        def __init__(self):
+            self.rotate_kwargs = []
+
+        def try_refresh_current(self, api_key_hint=None):
+            return None
+
+        def mark_exhausted_and_rotate(self, **kwargs):
+            self.rotate_kwargs.append(kwargs)
+            return next_entry
+
+    pool = _FakePool()
+    agent = _auth_recovery_agent(pool)
+
+    recovered, has_retried_429 = recover_with_credential_pool(
+        agent,
+        status_code=401,
+        has_retried_429=False,
+        classified_reason=FailoverReason.auth,
+        error_context={"message": "token_expired", "reason": "unauthorized"},
+    )
+
+    assert recovered is True
+    assert has_retried_429 is False
+    assert len(pool.rotate_kwargs) == 1
+    assert pool.rotate_kwargs[0]["api_key_hint"] == "access-token-A"
+    assert pool.rotate_kwargs[0]["status_code"] == 401
+    agent._swap_credential.assert_called_once_with(next_entry)
