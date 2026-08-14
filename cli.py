@@ -4249,6 +4249,101 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return self._format_claude_code_status_model(claude_model)
         return claude_model.split("/")[-1] if "/" in claude_model else claude_model
 
+    def _loadout_status_enabled(self) -> bool:
+        """Return whether this process is the dedicated hermes-loadout launcher."""
+        return "hermes-loadout" in (getattr(self, "preloaded_skills", None) or [])
+
+    def _ensure_loadout_turn_status(self):
+        if not self._loadout_status_enabled():
+            return None
+        tracker = getattr(self, "_loadout_turn_status", None)
+        if tracker is None:
+            from hermes_cli.loadout_turn_status import LoadoutTurnStatus
+
+            tracker = LoadoutTurnStatus()
+            self._loadout_turn_status = tracker
+        return tracker
+
+    def _set_loadout_turn_status(self, status: str, *, phase: str = "") -> None:
+        tracker = self._ensure_loadout_turn_status()
+        if tracker is None:
+            return
+        actions = {
+            "RUNNING": lambda: tracker.progress(phase=phase or "Hermes 요청 처리"),
+            "WAITING": lambda: tracker.wait(phase=phase or "모델 응답"),
+            "WAITING APPROVAL": tracker.wait_for_approval,
+            "DISCONNECTED": tracker.disconnect,
+            "COMPLETED": tracker.complete,
+            "FAILED": tracker.fail,
+            "STOPPED": tracker.stop,
+        }
+        action = actions.get(status)
+        if action is None:
+            raise ValueError(f"unsupported direct loadout status: {status}")
+        action()
+        self._invalidate()
+
+    def _start_loadout_turn_status(self) -> None:
+        tracker = self._ensure_loadout_turn_status()
+        if tracker is not None:
+            tracker.start()
+            self._invalidate()
+
+    def _finish_loadout_turn_status(
+        self,
+        result,
+        *,
+        interrupted: bool,
+        worker_alive: bool,
+    ) -> None:
+        if interrupted:
+            self._set_loadout_turn_status("STOPPED")
+        elif result is None and not worker_alive:
+            self._set_loadout_turn_status("DISCONNECTED")
+        elif not isinstance(result, dict) or result.get("failed") or result.get("partial"):
+            self._set_loadout_turn_status("FAILED")
+        elif result.get("completed") is True:
+            self._set_loadout_turn_status("COMPLETED")
+        else:
+            self._set_loadout_turn_status("FAILED")
+
+    def _get_loadout_turn_status_snapshot(self):
+        if not self._loadout_status_enabled():
+            return None
+        tracker = self._ensure_loadout_turn_status()
+        if tracker is None:
+            return None
+        snapshot = tracker.snapshot()
+        if getattr(self, "_approval_state", None) and snapshot.get("status") in {
+            "RUNNING",
+            "WAITING",
+            "DELAYED",
+            "STALLED",
+        }:
+            snapshot = dict(snapshot)
+            snapshot.update(
+                {
+                    "status": "WAITING APPROVAL",
+                    "emoji": "🟣",
+                    "label": "🟣 WAITING APPROVAL",
+                    "phase": "승인",
+                    "detail": "사용자 승인 대기",
+                }
+            )
+        return snapshot
+
+    @staticmethod
+    def _loadout_status_style(status: str) -> str:
+        if status in {"RUNNING", "COMPLETED"}:
+            return "class:status-bar-good"
+        if status in {"WAITING", "WAITING APPROVAL", "DELAYED"}:
+            return "class:status-bar-warn"
+        if status == "STALLED":
+            return "class:status-bar-bad"
+        if status in {"DISCONNECTED", "FAILED"}:
+            return "class:status-bar-critical"
+        return "class:status-bar-dim"
+
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
         # self.model reflects the originally configured model and never
@@ -4324,6 +4419,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "compressions": 0,
             "active_background_tasks": 0,
             "active_background_processes": 0,
+            "loadout_status": self._get_loadout_turn_status_snapshot(),
         }
 
         # Count live /background tasks. The dict entry is removed in the
@@ -4590,9 +4686,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 if reset_remaining:
                     usage_text += f" {reset_remaining}"
 
+            loadout_status = snapshot.get("loadout_status") or {}
+            loadout_label = str(loadout_status.get("label") or "")
+
             yolo_active = self._is_session_yolo_active()
             if width < 52:
-                text = f"⚕ {display_model_short}{usage_text} · {duration_label}"
+                parts = [f"⚕ {display_model_short}{usage_text}"]
+                if loadout_label:
+                    parts.append(loadout_label)
+                parts.append(duration_label)
+                text = " · ".join(parts)
                 if yolo_active:
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
@@ -4602,6 +4705,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 # footer. Two adjacent percentages look like conflicting quota
                 # readings.
                 parts = [f"⚕ {display_model_short}{usage_text}"]
+                if loadout_label:
+                    parts.append(loadout_label)
                 if agent_usage_percent is None:
                     parts.append(percent_label)
                 compressions = snapshot.get("compressions", 0)
@@ -4626,7 +4731,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {display_model_short}{usage_text}", context_label]
+            parts = [f"⚕ {display_model_short}{usage_text}"]
+            if loadout_label:
+                parts.append(loadout_label)
+            parts.append(context_label)
             # If an external-agent daily usage bar is present, avoid showing a
             # second percentage for context pressure. Otherwise keep the normal
             # context percentage so upstream status-bar tests and non-daily
@@ -4674,15 +4782,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 agent_usage_percent,
                 reset_at=str(snapshot.get("agent_usage_reset_at") or ""),
             )
+            loadout_status = snapshot.get("loadout_status") or {}
+            loadout_label = str(loadout_status.get("label") or "")
+            loadout_style = self._loadout_status_style(
+                str(loadout_status.get("status") or "")
+            )
 
             if width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", display_model_short),
                     *usage_frags,
+                ]
+                if loadout_label:
+                    frags.extend([
+                        ("class:status-bar-dim", " · "),
+                        (loadout_style, loadout_label),
+                    ])
+                frags.extend([
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
-                ]
+                ])
                 if yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -4699,6 +4819,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar-strong", display_model_short),
                         *usage_frags,
                     ]
+                    if loadout_label:
+                        frags.extend([
+                            ("class:status-bar-dim", " · "),
+                            (loadout_style, loadout_label),
+                        ])
                     if agent_usage_percent is None:
                         frags.extend([
                             ("class:status-bar-dim", " · "),
@@ -4736,9 +4861,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", display_model_short),
                         *usage_frags,
+                    ]
+                    if loadout_label:
+                        frags.extend([
+                            ("class:status-bar-dim", " │ "),
+                            (loadout_style, loadout_label),
+                        ])
+                    frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
-                    ]
+                    ])
                     # Context pressure is shown once, as the raw token count
                     # (e.g. 172K/1M). The redundant bar+% graphic is intentionally
                     # omitted so the footer never shows two context indicators.
@@ -4886,6 +5018,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         """Called by agent when thinking starts/stops. Updates TUI spinner."""
         if not text:
             self._flush_reasoning_preview(force=True)
+        elif getattr(self, "_agent_running", False):
+            self._set_loadout_turn_status("WAITING", phase="모델 응답")
         self._spinner_text = text or ""
         self._tool_start_time = 0.0  # clear tool timer when switching to thinking
         self._invalidate()
@@ -9558,6 +9692,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         """
         if event_type == "tool.completed":
             self._tool_start_time = 0.0
+            if getattr(self, "_agent_running", False):
+                self._set_loadout_turn_status("WAITING", phase="모델 응답")
             # Print stacked scrollback line for "all" / "new" modes
             if function_name and self.tool_progress_mode in {"all", "new"}:
                 duration = kwargs.get("duration", 0.0)
@@ -9608,6 +9744,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if event_type != "tool.started":
             return
         if function_name and not function_name.startswith("_"):
+            if getattr(self, "_agent_running", False):
+                self._set_loadout_turn_status("RUNNING", phase=f"{function_name} 실행")
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(function_name)
             label = preview or function_name
@@ -10585,6 +10723,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # this to True. Early returns (credential refresh failure, etc.)
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
+        self._start_loadout_turn_status()
 
         # Bridge-profile turns (profile config pins model.provider:
         # claude-code-cli — e.g. clara/reviewer bot profiles) never resolve a
@@ -10618,6 +10757,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if not _turn_via_claude_code_profile:
             # Refresh provider credentials if needed (handles key rotation transparently)
             if not self._ensure_runtime_credentials():
+                self._set_loadout_turn_status("FAILED")
                 return None
 
             turn_route = self._resolve_turn_agent_config(message)
@@ -10632,6 +10772,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 runtime_override=turn_route["runtime"],
                 request_overrides=turn_route.get("request_overrides"),
             ):
+                self._set_loadout_turn_status("FAILED")
                 return None
         
         # Route image attachments based on the active model's vision capability.
@@ -10709,6 +10850,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     for w in _ctx_result.warnings:
                         _cprint(f"  {_DIM}⚠ {w}{_RST}")
                     if _ctx_result.blocked:
+                        self._set_loadout_turn_status("FAILED")
                         return "\n".join(_ctx_result.warnings) or "Context injection refused."
                     message = _ctx_result.message
             except Exception as e:
@@ -11245,6 +11387,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # Expose the flag for post-turn hooks (e.g. goal continuation)
             # so they can skip themselves when the turn was user-cancelled.
             self._last_turn_interrupted = _interrupted_this_turn
+            self._finish_loadout_turn_status(
+                result,
+                interrupted=bool(_interrupted_this_turn or interrupt_msg is not None),
+                worker_alive=agent_thread.is_alive(),
+            )
             if _interrupted_this_turn:
                 pending_message = result.get("interrupt_message") or interrupt_msg
                 # Add indicator that we were interrupted
@@ -11371,6 +11518,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return response
             
         except Exception as e:
+            self._set_loadout_turn_status("FAILED")
             print(f"Error: {e}")
             return None
         finally:
