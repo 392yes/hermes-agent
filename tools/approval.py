@@ -29,6 +29,31 @@ logger = logging.getLogger(__name__)
 # instantly bypass all approval checks — a prompt-injection escalation path.
 _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
 
+# Internal process policy used only by the dedicated hermes-loadout launcher.
+# Freeze it at import time so an in-process skill cannot switch approval policy
+# after the security module is loaded. Gateways, cron, ACP, and other launchers
+# keep their configured approval behavior.
+_LOADOUT_CRITICAL_ONLY_FROZEN: bool = is_truthy_value(
+    os.getenv("HERMES_LOADOUT_CRITICAL_ONLY_COMMANDS", "")
+)
+
+_LOADOUT_ROUTINE_APPROVAL_DESCRIPTIONS = frozenset(
+    {
+        "shell command via -c/-lc flag",
+        "script execution via -e/-c flag",
+    }
+)
+_CRITICAL_ONLY_COMMAND_RE = re.compile(
+    r"(?:"
+    r"\brm\s+(?:-[^\s]+\s+)*"
+    r"(?:\.{1,2}(?:/|\s|$)|[^\n]*\.git(?:/|\s|$))|"
+    r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:[/\w]*/)?(?:ba)?sh\b|"
+    r"\bgit\s+(?:reset\s+--hard|push\b[^\n]*(?:--force|-f\b)|"
+    r"clean\s+-[^\s]*f|branch\s+-D)\b"
+    r")",
+    re.IGNORECASE,
+)
+
 # Per-thread/per-task gateway session identity.
 # Gateway runs agent turns concurrently in executor threads, so reading a
 # process-global env var for session identity is racy. Keep env fallback for
@@ -665,6 +690,19 @@ def detect_dangerous_command(command: str) -> tuple:
             pattern_key = description
             return (True, pattern_key, description)
     return (False, None, None)
+
+
+def _is_loadout_routine_false_positive(command: str) -> bool:
+    """True only when every matched danger is an allowed -c/-e wrapper."""
+    normalized = _normalize_command_for_detection(command).lower()
+    matched_descriptions = {
+        description.lower()
+        for pattern_re, description in DANGEROUS_PATTERNS_COMPILED
+        if pattern_re.search(normalized)
+    }
+    return bool(matched_descriptions) and matched_descriptions.issubset(
+        _LOADOUT_ROUTINE_APPROVAL_DESCRIPTIONS
+    )
 
 
 # =========================================================================
@@ -1479,6 +1517,28 @@ def check_all_command_guards(command: str, env_type: str,
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
+
+    # Dedicated hermes-loadout interactive policy: routine regex false
+    # positives (notably local python/bash -c invocations) proceed without an
+    # auxiliary-model round trip or user prompt. Security-scanner warnings and
+    # destructive/credential/external commands remain on the normal manual
+    # path. Gateway/ask/cron contexts never inherit this launcher-only policy.
+    if (
+        _LOADOUT_CRITICAL_ONLY_FROZEN
+        and is_cli
+        and not is_gateway
+        and not is_ask
+        and not env_var_enabled("HERMES_CRON_SESSION")
+        and tirith_result["action"] == "allow"
+        and not _CRITICAL_ONLY_COMMAND_RE.search(command)
+        and _is_loadout_routine_false_positive(command)
+    ):
+        return {
+            "approved": True,
+            "message": None,
+            "critical_only_approved": True,
+            "description": "; ".join(desc for _, desc, _ in warnings),
+        }
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
