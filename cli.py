@@ -3821,6 +3821,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
+        self._loadout_orchestrator_status_monitor = None
         self._active_session_lease = None
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
@@ -4264,6 +4265,54 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._loadout_turn_status = tracker
         return tracker
 
+    def _start_loadout_orchestrator_status_monitor(self) -> None:
+        """Start the launcher-scoped canonical run observer off-thread."""
+        if not self._loadout_status_enabled():
+            return
+        monitor = getattr(self, "_loadout_orchestrator_status_monitor", None)
+        if monitor is not None:
+            return
+        try:
+            from hermes_cli.loadout_orchestrator_status import (
+                LoadoutOrchestratorStatusMonitor,
+            )
+
+            monitor = LoadoutOrchestratorStatusMonitor(
+                session_key=str(getattr(self, "session_id", "") or ""),
+                on_change=self._invalidate,
+            )
+            self._loadout_orchestrator_status_monitor = monitor
+            monitor.start()
+        except Exception:
+            self._loadout_orchestrator_status_monitor = None
+
+    def _stop_loadout_orchestrator_status_monitor(self) -> None:
+        """Stop only the read-only observer, never the orchestrator it watches."""
+        monitor = getattr(self, "_loadout_orchestrator_status_monitor", None)
+        self._loadout_orchestrator_status_monitor = None
+        if monitor is not None:
+            try:
+                monitor.stop()
+            except Exception:
+                pass
+
+    def _get_loadout_orchestrator_status_snapshot(self):
+        monitor = getattr(self, "_loadout_orchestrator_status_monitor", None)
+        if monitor is None:
+            return None
+        try:
+            return monitor.snapshot()
+        except Exception:
+            return None
+
+    def _rebind_loadout_orchestrator_status_monitor(self) -> None:
+        monitor = getattr(self, "_loadout_orchestrator_status_monitor", None)
+        if monitor is not None:
+            try:
+                monitor.rebind_session(str(getattr(self, "session_id", "") or ""))
+            except Exception:
+                pass
+
     def _set_loadout_turn_status(self, status: str, *, phase: str = "") -> None:
         tracker = self._ensure_loadout_turn_status()
         if tracker is None:
@@ -4330,6 +4379,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     "detail": "사용자 승인 대기",
                 }
             )
+        canonical = self._get_loadout_orchestrator_status_snapshot()
+        if canonical:
+            canonical_status = str(canonical.get("status") or "")
+            foreground_status = str(snapshot.get("status") or "")
+            foreground_live = bool(getattr(self, "_agent_running", False)) and (
+                foreground_status
+                in {"RUNNING", "WAITING", "DELAYED", "STALLED", "WAITING APPROVAL"}
+            )
+            if canonical_status not in {"COMPLETED", "FAILED", "STOPPED"}:
+                return canonical
+            if not foreground_live:
+                return canonical
         return snapshot
 
     @staticmethod
@@ -4690,6 +4751,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             loadout_label = str(loadout_status.get("label") or "")
 
             yolo_active = self._is_session_yolo_active()
+            if (
+                width < 76
+                and loadout_label
+                and loadout_status.get("source") == "orchestrator"
+            ):
+                return self._trim_status_bar_text(loadout_label, width)
             if width < 52:
                 parts = [f"⚕ {display_model_short}{usage_text}"]
                 if loadout_label:
@@ -4787,6 +4854,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             loadout_style = self._loadout_status_style(
                 str(loadout_status.get("status") or "")
             )
+
+            if (
+                width < 76
+                and loadout_label
+                and loadout_status.get("source") == "orchestrator"
+            ):
+                return [
+                    (loadout_style, self._trim_status_bar_text(loadout_label, width))
+                ]
 
             if width < 52:
                 frags = [
@@ -6660,6 +6736,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._pending_title = None
         self._resumed = False
         _sync_process_session_id(self.session_id)
+        self._rebind_loadout_orchestrator_status_monitor()
 
         if self.agent:
             self.agent.session_id = self.session_id
@@ -8946,6 +9023,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 ):
                     self.session_id = self.agent.session_id
                     self._pending_title = None
+                    self._rebind_loadout_orchestrator_status_monitor()
                     # Manual /compress replaces conversation_history with a new
                     # compressed handoff for the child session. Persist it from
                     # offset 0 so resume can recover the continuation after exit.
@@ -11336,6 +11414,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self._transfer_session_yolo(self.session_id, self.agent.session_id)
                 self.session_id = self.agent.session_id
                 self._pending_title = None
+                self._rebind_loadout_orchestrator_status_monitor()
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
@@ -13949,6 +14028,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         )
         _disable_prompt_toolkit_cpr_warning(app)
         self._app = app  # Store reference for clarify_callback
+        self._start_loadout_orchestrator_status_monitor()
 
         # ── Fix ghost status-bar lines on terminal resize ──────────────
         # Resize handling: monkey-patch prompt_toolkit's _output_screen_diff
@@ -14430,6 +14510,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 raise
         finally:
             self._should_exit = True
+            self._stop_loadout_orchestrator_status_monitor()
             # Interrupt the agent immediately so its daemon thread stops making
             # API calls and exits promptly (agent_thread is daemon, so the
             # process will exit once the main thread finishes, but interrupting

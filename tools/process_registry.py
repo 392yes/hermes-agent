@@ -1307,6 +1307,43 @@ class ProcessRegistry:
         except Exception:
             return 0
 
+    def snapshot_sessions(
+        self,
+        *,
+        session_key: str = None,
+        task_id: str = None,
+        include_finished: bool = True,
+    ) -> list:
+        """Return immutable process metadata without consuming notifications.
+
+        Unlike ``list_sessions()``, this observer-facing API preserves the full
+        command and omits output buffers. It performs no PID reconciliation,
+        subprocess work, or completion-consumed bookkeeping, so status monitors
+        can safely use it without changing process semantics.
+        """
+        with self._lock:
+            sessions = list(self._running.values())
+            if include_finished:
+                sessions.extend(self._finished.values())
+            result = []
+            for session in sessions:
+                if session_key is not None and session.session_key != session_key:
+                    continue
+                if task_id is not None and session.task_id != task_id:
+                    continue
+                result.append({
+                    "session_id": session.id,
+                    "session_key": session.session_key,
+                    "task_id": session.task_id,
+                    "command": session.command,
+                    "cwd": session.cwd,
+                    "pid": session.pid,
+                    "started_at": session.started_at,
+                    "status": "exited" if session.exited else "running",
+                    "exit_code": session.exit_code,
+                })
+        return result
+
     def list_sessions(self, task_id: str = None) -> list:
         """List all running and recently-finished processes."""
         with self._lock:

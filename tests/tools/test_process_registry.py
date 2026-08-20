@@ -426,6 +426,47 @@ class TestListSessions:
         assert "output_preview" in entry
 
 
+class TestSnapshotSessions:
+    def test_returns_untruncated_read_only_metadata(self, registry):
+        command = "python3 orchestrate.py resume --target " + ("x" * 300)
+        session = _make_session(command=command, task_id="default")
+        session.session_key = "cli-session"
+        session.cwd = "/tmp/project"
+        session.pid = 4321
+        registry._running[session.id] = session
+
+        entry = registry.snapshot_sessions(session_key="cli-session")[0]
+
+        assert entry == {
+            "session_id": session.id,
+            "session_key": "cli-session",
+            "task_id": "default",
+            "command": command,
+            "cwd": "/tmp/project",
+            "pid": 4321,
+            "started_at": session.started_at,
+            "status": "running",
+            "exit_code": None,
+        }
+        assert "output_preview" not in entry
+
+    def test_filters_without_consuming_completion(self, registry):
+        matching = _make_session(sid="proc_match", exited=True, exit_code=0)
+        matching.session_key = "cli-session"
+        other = _make_session(sid="proc_other")
+        other.session_key = "other-session"
+        registry._finished[matching.id] = matching
+        registry._running[other.id] = other
+
+        entries = registry.snapshot_sessions(
+            session_key="cli-session",
+            include_finished=True,
+        )
+
+        assert [entry["session_id"] for entry in entries] == ["proc_match"]
+        assert registry.is_completion_consumed("proc_match") is False
+
+
 # =========================================================================
 # Active process queries
 # =========================================================================
