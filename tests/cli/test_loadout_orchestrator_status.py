@@ -95,6 +95,38 @@ def test_parse_loadout_process_binds_exact_session_and_target(tmp_path: Path) ->
     assert candidate.subcommand == "resume"
 
 
+def test_parse_loadout_process_accepts_canonical_auto_start_options(tmp_path: Path) -> None:
+    skills_root, script = _skill_tree(tmp_path)
+    target = tmp_path / "project"
+    target.mkdir()
+    task_file = tmp_path / "task.txt"
+    task_file.write_text("task", encoding="utf-8")
+    entry = {
+        "session_id": "proc_auto",
+        "session_key": "session-1",
+        "task_id": "session-1",
+        "command": (
+            f"python3 '{script}' start --target '{target}' "
+            f"--task-file '{task_file}' --execution-mode fast "
+            "--approval-target slack:C0B49801526 --approval-mode critical-only"
+        ),
+        "cwd": str(tmp_path),
+        "pid": 1234,
+        "started_at": 100.0,
+        "status": "running",
+    }
+
+    candidate = parse_loadout_process(
+        entry,
+        session_key="session-1",
+        skill_roots=[skills_root],
+    )
+
+    assert candidate is not None
+    assert candidate.subcommand == "start"
+    assert candidate.target == target.resolve()
+
+
 def test_parse_loadout_process_rejects_other_session_and_status_probe(tmp_path: Path) -> None:
     skills_root, script = _skill_tree(tmp_path)
     target = tmp_path / "project"

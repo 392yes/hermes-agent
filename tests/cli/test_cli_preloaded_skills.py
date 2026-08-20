@@ -92,6 +92,58 @@ def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
     assert cli_obj.preloaded_skills == ["hermes-agent-dev", "github-auth"]
 
 
+def test_main_appends_launcher_scoped_automatic_loadout_contract(monkeypatch):
+    import cli as cli_mod
+
+    created = {}
+
+    def fake_cli(**kwargs):
+        created["cli"] = _DummyCLI(**kwargs)
+        return created["cli"]
+
+    monkeypatch.setenv("HERMES_LOADOUT_AUTO_ORCHESTRATE", "1")
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(
+        cli_mod,
+        "build_preloaded_skills_prompt",
+        lambda skills, task_id=None: (
+            "skill prompt",
+            ["hermes-loadout", "hugo-crew-orchestration"],
+            [],
+        ),
+    )
+
+    with pytest.raises(SystemExit):
+        cli_mod.main(
+            skills="hermes-loadout,hugo-crew-orchestration",
+            list_tools=True,
+        )
+
+    system_prompt = created["cli"].system_prompt
+    assert "Automatic Loadout execution mode is active" in system_prompt
+    assert "every substantive non-control user request" in system_prompt
+    assert "scripts/orchestrate.py start" in system_prompt
+    assert "Do not require /hermes-loadout" in system_prompt
+
+
+def test_main_fails_closed_when_auto_loadout_lacks_the_loadout_skill(monkeypatch):
+    import cli as cli_mod
+
+    monkeypatch.setenv("HERMES_LOADOUT_AUTO_ORCHESTRATE", "1")
+    monkeypatch.setattr(cli_mod, "HermesCLI", lambda **kwargs: _DummyCLI(**kwargs))
+    monkeypatch.setattr(
+        cli_mod,
+        "build_preloaded_skills_prompt",
+        lambda skills, task_id=None: ("other skill", ["github-auth"], []),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="automatic hermes-loadout mode requires the hermes-loadout skill",
+    ):
+        cli_mod.main(skills="github-auth", list_tools=True)
+
+
 def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
     import cli as cli_mod
 

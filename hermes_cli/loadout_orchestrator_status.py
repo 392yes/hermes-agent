@@ -42,6 +42,7 @@ _VALUE_OPTIONS = {
             "--target",
             "--task-file",
             "--mode",
+            "--execution-mode",
             "--approval-target",
             "--hermes-bin",
             "--store-script",
