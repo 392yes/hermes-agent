@@ -24,18 +24,24 @@ _MAX_TASK_BYTES = 128 * 1024
 _APPROVAL_RE = re.compile(
     r"^승인\s+([A-Za-z0-9_-]{1,128})\s+선택\s+([A-Za-z0-9_-]{1,128})$"
 )
+_POLITE_CONTROL_PREFIX = (
+    r"(?:(?:(?:could|can|would|will)\s+you|can\s+we)\s+(?:please\s+)?|"
+    r"please\s+|let(?:'s| us)\s+)?"
+)
 _APPROVAL_EN_RE = re.compile(
-    r"^(?:please\s+)?(?:approve|approval)\s+([A-Za-z0-9_-]{1,128})\s+"
+    rf"^{_POLITE_CONTROL_PREFIX}(?:approve|approval)\s+"
+    r"([A-Za-z0-9_-]{1,128})\s+"
     r"(?:option|select)\s+([A-Za-z0-9_-]{1,128})$",
     re.IGNORECASE,
 )
 _REJECT_RE = re.compile(r"^거절\s+([A-Za-z0-9_-]{1,128})$")
 _REJECT_EN_RE = re.compile(
-    r"^(?:please\s+)?(?:reject|deny)\s+([A-Za-z0-9_-]{1,128})$",
+    rf"^{_POLITE_CONTROL_PREFIX}(?:reject|deny)\s+"
+    r"([A-Za-z0-9_-]{1,128})$",
     re.IGNORECASE,
 )
 _STATUS_EN_RE = re.compile(
-    r"^(?:(?:please|could you|can you)\s+)?(?:"
+    rf"^{_POLITE_CONTROL_PREFIX}(?:"
     r"(?:show|tell)(?:\s+me)?\s+(?:the\s+)?(?:current\s+)?"
     r"(?:(?:run|task)\s+)?(?:status|progress)|"
     r"(?:what(?:'s| is)|how is)\s+(?:the\s+)?(?:current\s+)?"
@@ -43,15 +49,12 @@ _STATUS_EN_RE = re.compile(
     re.IGNORECASE,
 )
 _RESUME_EN_RE = re.compile(
-    r"^(?:please\s+)?(?:continue|resume)"
+    rf"^{_POLITE_CONTROL_PREFIX}(?:continue|resume)"
     r"(?:\s+(?:the\s+)?(?:current\s+)?(?:run|task))?(?:\s+please)?$",
     re.IGNORECASE,
 )
-_CONTROL_LIKE_EN_RE = re.compile(
-    r"^(?:(?:please|could you|can you)\s+)?(?:"
-    r"status|progress|show|tell|check|what|how|continue|resume|proceed|"
-    r"approve|approval|reject|deny|cancel|stop|yes|no|sure|ok|okay|"
-    r"go ahead|sounds good|looks good)\b",
+_APPROVAL_LIKE_EN_RE = re.compile(
+    rf"^{_POLITE_CONTROL_PREFIX}(?:approve|approval|reject|deny)\b",
     re.IGNORECASE,
 )
 _TARGET_LOCK_RELATIVE = Path("prep/agent-loop/.orchestrator.lock")
@@ -165,15 +168,15 @@ def _classify_request(text: str) -> tuple[str, tuple[str, ...]]:
         return "status", ()
     if normalized in _RESUME_INPUTS or _RESUME_EN_RE.fullmatch(normalized):
         return "resume", ()
-    approval = _APPROVAL_RE.fullmatch(stripped) or _APPROVAL_EN_RE.fullmatch(stripped)
+    approval = _APPROVAL_RE.fullmatch(stripped) or _APPROVAL_EN_RE.fullmatch(normalized)
     if approval:
         return "approve", approval.groups()
-    rejection = _REJECT_RE.fullmatch(stripped) or _REJECT_EN_RE.fullmatch(stripped)
+    rejection = _REJECT_RE.fullmatch(stripped) or _REJECT_EN_RE.fullmatch(normalized)
     if rejection:
         return "reject", rejection.groups()
     if normalized in _AMBIGUOUS_CONTROL_INPUTS:
         return "passthrough", ()
-    if _CONTROL_LIKE_EN_RE.match(normalized):
+    if _APPROVAL_LIKE_EN_RE.match(normalized):
         return "passthrough", ()
     if re.match(r"^수정\s+[A-Za-z0-9_-]{1,128}\s*:", stripped):
         return "passthrough", ()

@@ -139,13 +139,18 @@ def test_spawn_failures_are_wrapped_as_dispatch_errors(tmp_path: Path) -> None:
         ("What is the status?", "status"),
         ("show status", "status"),
         ("Could you show me the status?", "status"),
+        ("Could you please show me the status?", "status"),
         ("계속", "resume"),
         ("continue please", "resume"),
         ("Please continue", "resume"),
+        ("Can we continue?", "resume"),
+        ("Could you please continue?", "resume"),
         ("Resume the current run", "resume"),
+        ("Let's resume the current run", "resume"),
         ("승인 LAP-001 선택 RETRY", "approve"),
         ("approve LAP-001 option RETRY", "approve"),
         ("Please approve LAP-001 option RETRY", "approve"),
+        ("Would you please approve LAP-001 option RETRY?", "approve"),
         ("거절 LAP-001", "reject"),
         ("reject LAP-001", "reject"),
     ],
@@ -252,6 +257,35 @@ def test_status_feature_implementation_request_remains_a_real_task(tmp_path: Pat
     calls = []
     result = dispatch_automatic_loadout_request(
         "상태 관리 기능 구현해줘",
+        loaded_skills=["hermes-loadout"],
+        session_key="session-1",
+        cwd=tmp_path,
+        environ={AUTO_LOADOUT_ENV: "1"},
+        orchestrator_path=_skill_script(tmp_path),
+        runtime_dir=tmp_path / "runtime",
+        spawn_background=lambda argv, **kwargs: calls.append(argv) or "proc_task",
+    )
+
+    assert result.action == "start"
+    assert calls[0][2] == "start"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Show a status badge in the header.",
+        "Check the auth code and fix the crash.",
+        "Stop leaking credentials in logs.",
+        "Okay, implement the requested feature.",
+    ],
+)
+def test_control_keyword_implementation_requests_remain_real_tasks(
+    tmp_path: Path,
+    text: str,
+) -> None:
+    calls = []
+    result = dispatch_automatic_loadout_request(
+        text,
         loaded_skills=["hermes-loadout"],
         session_key="session-1",
         cwd=tmp_path,
