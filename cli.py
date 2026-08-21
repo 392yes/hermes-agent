@@ -14440,8 +14440,8 @@ def main(
     from hermes_cli.loadout_auto_route import apply_automatic_loadout_contract
 
     cli.system_prompt = apply_automatic_loadout_contract(
-        cli.system_prompt,
-        cli.preloaded_skills,
+        getattr(cli, "system_prompt", ""),
+        getattr(cli, "preloaded_skills", None) or [],
     )
 
     # Inject worktree context into agent's system prompt
