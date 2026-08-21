@@ -24,10 +24,11 @@ _MAX_TASK_BYTES = 128 * 1024
 _APPROVAL_RE = re.compile(
     r"^승인\s+([A-Za-z0-9_-]{1,128})\s+선택\s+([A-Za-z0-9_-]{1,128})$"
 )
-_POLITE_CONTROL_PREFIX = (
+_EXPLICIT_POLITE_CONTROL_PREFIX = (
     r"(?:(?:(?:could|can|would|will)\s+you|can\s+we)\s+(?:please\s+)?|"
-    r"please\s+|let(?:'s| us)\s+)?"
+    r"please\s+|let(?:'s| us)\s+)"
 )
+_POLITE_CONTROL_PREFIX = rf"(?:{_EXPLICIT_POLITE_CONTROL_PREFIX})?"
 _APPROVAL_EN_RE = re.compile(
     rf"^{_POLITE_CONTROL_PREFIX}(?:approve|approval)\s+"
     r"([A-Za-z0-9_-]{1,128})\s+"
@@ -45,7 +46,7 @@ _STATUS_EN_RE = re.compile(
     r"(?:show|tell)(?:\s+me)?\s+(?:the\s+)?(?:current\s+)?"
     r"(?:(?:run|task)\s+)?(?:status|progress)|"
     r"(?:what(?:'s| is)|how is)\s+(?:the\s+)?(?:current\s+)?"
-    r"(?:(?:run|task)\s+)?(?:status|progress))$",
+    r"(?:(?:run|task)\s+)?(?:status|progress))(?:\s+please)?$",
     re.IGNORECASE,
 )
 _RESUME_EN_RE = re.compile(
@@ -54,7 +55,7 @@ _RESUME_EN_RE = re.compile(
     re.IGNORECASE,
 )
 _APPROVAL_LIKE_EN_RE = re.compile(
-    rf"^{_POLITE_CONTROL_PREFIX}(?:approve|approval|reject|deny)\b",
+    rf"^{_EXPLICIT_POLITE_CONTROL_PREFIX}(?:approve|approval|reject|deny)\b",
     re.IGNORECASE,
 )
 _TARGET_LOCK_RELATIVE = Path("prep/agent-loop/.orchestrator.lock")
@@ -111,6 +112,10 @@ _AMBIGUOUS_CONTROL_INPUTS = frozenset(
         "sure",
         "sounds good",
         "looks good",
+        "approve",
+        "approval",
+        "reject",
+        "deny",
     }
 )
 _INTERNAL_PREFIXES = (

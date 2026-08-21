@@ -140,6 +140,9 @@ def test_spawn_failures_are_wrapped_as_dispatch_errors(tmp_path: Path) -> None:
         ("show status", "status"),
         ("Could you show me the status?", "status"),
         ("Could you please show me the status?", "status"),
+        ("Can you show the current status please?", "status"),
+        ("Show me the status please", "status"),
+        ("What's the current run progress please?", "status"),
         ("계속", "resume"),
         ("continue please", "resume"),
         ("Please continue", "resume"),
@@ -277,6 +280,9 @@ def test_status_feature_implementation_request_remains_a_real_task(tmp_path: Pat
         "Check the auth code and fix the crash.",
         "Stop leaking credentials in logs.",
         "Okay, implement the requested feature.",
+        "Approval workflows need an audit trail.",
+        "Reject invalid authentication tokens at the gateway.",
+        "Deny unauthorized requests in the middleware.",
     ],
 )
 def test_control_keyword_implementation_requests_remain_real_tasks(
