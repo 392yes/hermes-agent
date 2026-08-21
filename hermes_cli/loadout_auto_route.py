@@ -25,13 +25,34 @@ _APPROVAL_RE = re.compile(
     r"^승인\s+([A-Za-z0-9_-]{1,128})\s+선택\s+([A-Za-z0-9_-]{1,128})$"
 )
 _APPROVAL_EN_RE = re.compile(
-    r"^(?:approve|approval)\s+([A-Za-z0-9_-]{1,128})\s+"
+    r"^(?:please\s+)?(?:approve|approval)\s+([A-Za-z0-9_-]{1,128})\s+"
     r"(?:option|select)\s+([A-Za-z0-9_-]{1,128})$",
     re.IGNORECASE,
 )
 _REJECT_RE = re.compile(r"^거절\s+([A-Za-z0-9_-]{1,128})$")
 _REJECT_EN_RE = re.compile(
-    r"^(?:reject|deny)\s+([A-Za-z0-9_-]{1,128})$", re.IGNORECASE
+    r"^(?:please\s+)?(?:reject|deny)\s+([A-Za-z0-9_-]{1,128})$",
+    re.IGNORECASE,
+)
+_STATUS_EN_RE = re.compile(
+    r"^(?:(?:please|could you|can you)\s+)?(?:"
+    r"(?:show|tell)(?:\s+me)?\s+(?:the\s+)?(?:current\s+)?"
+    r"(?:(?:run|task)\s+)?(?:status|progress)|"
+    r"(?:what(?:'s| is)|how is)\s+(?:the\s+)?(?:current\s+)?"
+    r"(?:(?:run|task)\s+)?(?:status|progress))$",
+    re.IGNORECASE,
+)
+_RESUME_EN_RE = re.compile(
+    r"^(?:please\s+)?(?:continue|resume)"
+    r"(?:\s+(?:the\s+)?(?:current\s+)?(?:run|task))?(?:\s+please)?$",
+    re.IGNORECASE,
+)
+_CONTROL_LIKE_EN_RE = re.compile(
+    r"^(?:(?:please|could you|can you)\s+)?(?:"
+    r"status|progress|show|tell|check|what|how|continue|resume|proceed|"
+    r"approve|approval|reject|deny|cancel|stop|yes|no|sure|ok|okay|"
+    r"go ahead|sounds good|looks good)\b",
+    re.IGNORECASE,
 )
 _TARGET_LOCK_RELATIVE = Path("prep/agent-loop/.orchestrator.lock")
 _STATUS_INPUTS = frozenset(
@@ -84,6 +105,9 @@ _AMBIGUOUS_CONTROL_INPUTS = frozenset(
         "no",
         "ok",
         "okay",
+        "sure",
+        "sounds good",
+        "looks good",
     }
 )
 _INTERNAL_PREFIXES = (
@@ -133,9 +157,13 @@ def _classify_request(text: str) -> tuple[str, tuple[str, ...]]:
     if not stripped or stripped.startswith(_INTERNAL_PREFIXES):
         return "passthrough", ()
     normalized = " ".join(stripped.lower().split()).strip(" ?？.!。")
-    if normalized in _STATUS_INPUTS or _STATUS_RE.fullmatch(normalized):
+    if (
+        normalized in _STATUS_INPUTS
+        or _STATUS_RE.fullmatch(normalized)
+        or _STATUS_EN_RE.fullmatch(normalized)
+    ):
         return "status", ()
-    if normalized in _RESUME_INPUTS:
+    if normalized in _RESUME_INPUTS or _RESUME_EN_RE.fullmatch(normalized):
         return "resume", ()
     approval = _APPROVAL_RE.fullmatch(stripped) or _APPROVAL_EN_RE.fullmatch(stripped)
     if approval:
@@ -144,6 +172,8 @@ def _classify_request(text: str) -> tuple[str, tuple[str, ...]]:
     if rejection:
         return "reject", rejection.groups()
     if normalized in _AMBIGUOUS_CONTROL_INPUTS:
+        return "passthrough", ()
+    if _CONTROL_LIKE_EN_RE.match(normalized):
         return "passthrough", ()
     if re.match(r"^수정\s+[A-Za-z0-9_-]{1,128}\s*:", stripped):
         return "passthrough", ()

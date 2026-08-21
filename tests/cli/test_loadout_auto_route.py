@@ -138,10 +138,14 @@ def test_spawn_failures_are_wrapped_as_dispatch_errors(tmp_path: Path) -> None:
         ("어디까지 진행됐어?", "status"),
         ("What is the status?", "status"),
         ("show status", "status"),
+        ("Could you show me the status?", "status"),
         ("계속", "resume"),
         ("continue please", "resume"),
+        ("Please continue", "resume"),
+        ("Resume the current run", "resume"),
         ("승인 LAP-001 선택 RETRY", "approve"),
         ("approve LAP-001 option RETRY", "approve"),
+        ("Please approve LAP-001 option RETRY", "approve"),
         ("거절 LAP-001", "reject"),
         ("reject LAP-001", "reject"),
     ],
@@ -187,7 +191,16 @@ def test_control_inputs_never_start_a_competing_run(
 
 @pytest.mark.parametrize(
     "text",
-    ["go ahead", "yes", "cancel", "stop", "ok"],
+    [
+        "go ahead",
+        "yes",
+        "cancel",
+        "stop",
+        "ok",
+        "sure",
+        "sounds good",
+        "Please approve this",
+    ],
 )
 def test_ambiguous_control_replies_bypass_new_task_dispatch(
     tmp_path: Path,
