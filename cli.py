@@ -43,7 +43,7 @@ from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -4191,6 +4191,83 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return f"opus-{opus_match.group(1)}.{opus_match.group(2)}"
 
         return model_short
+
+    def _maybe_dispatch_automatic_loadout_input(
+        self,
+        user_input: str,
+        *,
+        images: Sequence[Path] | None = None,
+    ) -> bool:
+        """Route launcher tasks to the canonical runner before foreground chat."""
+        from hermes_cli.loadout_auto_route import (
+            AUTO_LOADOUT_ENV,
+            AutoLoadoutDispatchError,
+            dispatch_automatic_loadout_request,
+        )
+
+        if os.environ.get(AUTO_LOADOUT_ENV) != "1":
+            return False
+        task = str(user_input or "")
+        if images:
+            attachments = "\n".join(f"- {Path(path)}" for path in images)
+            task = f"{task}\n\nAttached local files:\n{attachments}".strip()
+
+        canonical_reader = getattr(
+            self, "_get_loadout_orchestrator_status_snapshot", None
+        )
+        canonical = canonical_reader() or {} if callable(canonical_reader) else {}
+        canonical_status = str(canonical.get("status") or "")
+        process_session_id = str(
+            getattr(self, "_loadout_auto_process_session_id", "") or ""
+        )
+        candidate_ids = {
+            value
+            for value in (
+                process_session_id,
+                str(canonical.get("process_session_id") or ""),
+            )
+            if value
+        }
+        active_run = False
+        unknown_process = False
+        if candidate_ids:
+            try:
+                from tools.process_registry import process_registry
+
+                for candidate_id in candidate_ids:
+                    process_session = process_registry.get(candidate_id)
+                    if process_session is None:
+                        unknown_process = True
+                    elif not process_session.exited:
+                        active_run = True
+                        break
+            except Exception:
+                unknown_process = True
+        if (
+            not active_run
+            and (unknown_process or (canonical and not candidate_ids))
+            and canonical_status
+            not in {"WAITING APPROVAL", "COMPLETED", "FAILED", "STOPPED"}
+        ):
+            active_run = True
+        try:
+            result = dispatch_automatic_loadout_request(
+                task,
+                loaded_skills=getattr(self, "preloaded_skills", None) or [],
+                session_key=str(getattr(self, "session_id", "") or ""),
+                cwd=os.environ.get("TERMINAL_CWD") or os.getcwd(),
+                active_run=active_run,
+            )
+        except AutoLoadoutDispatchError as exc:
+            self._console_print(f"[bold red]Automatic hermes-loadout blocked:[/] {exc}")
+            return True
+        if not result.handled:
+            return False
+        if result.session_id:
+            self._loadout_auto_process_session_id = result.session_id
+        self._console_print(f"[bold {_accent_hex()}]{_escape(result.message)}[/]")
+        self._invalidate()
+        return True
 
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
@@ -13733,6 +13810,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         n = len(submit_images)
                         _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
 
+                    if self._maybe_dispatch_automatic_loadout_input(
+                        user_input,
+                        images=submit_images or None,
+                    ):
+                        continue
+
                     # Regular chat - run agent
                     self._agent_running = True
                     app.invalidate()  # Refresh status line
@@ -14353,6 +14436,13 @@ def main(
                 part for part in (cli.system_prompt, skills_prompt) if part
             ).strip()
             cli.preloaded_skills = loaded_skills
+
+    from hermes_cli.loadout_auto_route import apply_automatic_loadout_contract
+
+    cli.system_prompt = apply_automatic_loadout_contract(
+        getattr(cli, "system_prompt", ""),
+        getattr(cli, "preloaded_skills", None) or [],
+    )
 
     # Inject worktree context into agent's system prompt
     if wt_info:
