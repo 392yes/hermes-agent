@@ -16,6 +16,7 @@ from typing import Any
 import uuid
 
 AUTO_LOADOUT_ENV = "HERMES_LOADOUT_AUTO_ORCHESTRATE"
+APPROVAL_TARGET_ENV = "HERMES_LOADOUT_APPROVAL_TARGET"
 AUTO_LOADOUT_SYSTEM_PROMPT = """[Automatic Loadout execution mode is active.]
 For every substantive non-control user request, immediately execute the preloaded hermes-loadout skill contract by starting `scripts/orchestrate.py start` with the user's exact task. Do not implement the task directly in the foreground Hermes turn. Do not require /hermes-loadout; ordinary task text is the invocation. Every implementation cycle uses exactly 3 leaf builders in one parallel delegation batch, followed only after all 3 join by the named maker acting as a serial shared-file integrator. Resolve fast versus strict, parent tests, Coda/Hugo gates, multipart review, immutable fingerprints, timeout/turn budgets, and critical-only approvals through the canonical runner. Built-in TUI controls, canonical status/resume/approve/reject operations, approval replies, and status-only questions control the current run instead of starting a competing run. Never overlap a second writer on the same target."""
 
@@ -23,11 +24,28 @@ _MAX_TASK_BYTES = 128 * 1024
 _APPROVAL_RE = re.compile(
     r"^승인\s+([A-Za-z0-9_-]{1,128})\s+선택\s+([A-Za-z0-9_-]{1,128})$"
 )
+_APPROVAL_EN_RE = re.compile(
+    r"^(?:approve|approval)\s+([A-Za-z0-9_-]{1,128})\s+"
+    r"(?:option|select)\s+([A-Za-z0-9_-]{1,128})$",
+    re.IGNORECASE,
+)
 _REJECT_RE = re.compile(r"^거절\s+([A-Za-z0-9_-]{1,128})$")
+_REJECT_EN_RE = re.compile(
+    r"^(?:reject|deny)\s+([A-Za-z0-9_-]{1,128})$", re.IGNORECASE
+)
+_TARGET_LOCK_RELATIVE = Path("prep/agent-loop/.orchestrator.lock")
 _STATUS_INPUTS = frozenset(
     {
         "status",
         "status check",
+        "status please",
+        "what is the status",
+        "what's the status",
+        "show status",
+        "show the status",
+        "show me the status",
+        "progress",
+        "progress please",
         "상태",
         "상태 확인",
         "현재 상태",
@@ -45,12 +63,27 @@ _STATUS_RE = re.compile(
 _RESUME_INPUTS = frozenset(
     {
         "continue",
+        "continue please",
         "resume",
+        "resume please",
         "계속",
         "계속 진행",
         "계속해",
         "재개",
         "재개해",
+    }
+)
+_AMBIGUOUS_CONTROL_INPUTS = frozenset(
+    {
+        "yes",
+        "yes please",
+        "go ahead",
+        "proceed",
+        "cancel",
+        "stop",
+        "no",
+        "ok",
+        "okay",
     }
 )
 _INTERNAL_PREFIXES = (
@@ -99,17 +132,19 @@ def _classify_request(text: str) -> tuple[str, tuple[str, ...]]:
     stripped = text.strip()
     if not stripped or stripped.startswith(_INTERNAL_PREFIXES):
         return "passthrough", ()
-    normalized = " ".join(stripped.lower().split()).rstrip("?？")
+    normalized = " ".join(stripped.lower().split()).strip(" ?？.!。")
     if normalized in _STATUS_INPUTS or _STATUS_RE.fullmatch(normalized):
         return "status", ()
     if normalized in _RESUME_INPUTS:
         return "resume", ()
-    approval = _APPROVAL_RE.fullmatch(stripped)
+    approval = _APPROVAL_RE.fullmatch(stripped) or _APPROVAL_EN_RE.fullmatch(stripped)
     if approval:
         return "approve", approval.groups()
-    rejection = _REJECT_RE.fullmatch(stripped)
+    rejection = _REJECT_RE.fullmatch(stripped) or _REJECT_EN_RE.fullmatch(stripped)
     if rejection:
         return "reject", rejection.groups()
+    if normalized in _AMBIGUOUS_CONTROL_INPUTS:
+        return "passthrough", ()
     if re.match(r"^수정\s+[A-Za-z0-9_-]{1,128}\s*:", stripped):
         return "passthrough", ()
     return "start", ()
@@ -127,6 +162,25 @@ def _resolve_target(cwd: str | os.PathLike[str] | None) -> Path:
         if (candidate / ".git").exists():
             return candidate
     return resolved
+
+
+def _target_has_writer(target: Path) -> bool:
+    """Fail closed when the canonical runner lock exists for this target."""
+
+    lock_path = target / _TARGET_LOCK_RELATIVE
+    try:
+        lock_stat = lock_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AutoLoadoutDispatchError(
+            "could not inspect the canonical loadout writer lock"
+        ) from exc
+    if stat.S_ISLNK(lock_stat.st_mode) or not stat.S_ISREG(lock_stat.st_mode):
+        raise AutoLoadoutDispatchError(
+            "canonical loadout writer lock must be a regular file"
+        )
+    return True
 
 
 def _resolve_orchestrator_path(session_key: str) -> Path:
@@ -269,29 +323,35 @@ def dispatch_automatic_loadout_request(
     )
     if script.is_symlink() or not script.is_file():
         raise AutoLoadoutDispatchError("hermes-loadout orchestrator must be a regular file")
-    if action != "status" and active_run:
+    if action != "status" and (active_run or _target_has_writer(target)):
         return AutoLoadoutDispatchResult(
             True,
             "active",
-            "A canonical hermes-loadout run is already active for this session; no competing writer was started.",
+            "A canonical hermes-loadout run is already active for this target; no competing writer was started.",
             target=str(target),
         )
 
     argv = [sys.executable, str(script), action, "--target", str(target)]
     if action == "start":
-        task_file = _write_task_file(task, Path(runtime_dir or _runtime_dir()))
+        try:
+            task_file = _write_task_file(task, Path(runtime_dir or _runtime_dir()))
+        except AutoLoadoutDispatchError:
+            raise
+        except (OSError, RuntimeError) as exc:
+            raise AutoLoadoutDispatchError("could not create the loadout task file") from exc
         argv.extend(
             [
                 "--task-file",
                 str(task_file),
                 "--execution-mode",
                 "fast",
-                "--approval-target",
-                "slack:C0B49801526",
                 "--approval-mode",
                 "critical-only",
             ]
         )
+        approval_target = str(env.get(APPROVAL_TARGET_ENV) or "").strip()
+        if approval_target:
+            argv.extend(["--approval-target", approval_target])
     elif action == "approve":
         argv.extend(["--approval-id", control_args[0], "--option", control_args[1]])
     elif action == "reject":
@@ -300,14 +360,21 @@ def dispatch_automatic_loadout_request(
     env_overrides = {AUTO_LOADOUT_ENV: "0"}
     if action in {"start", "resume", "approve"}:
         spawn = spawn_background or _default_spawn_background
-        session_id = str(
-            spawn(
-                argv,
-                cwd=target,
-                session_key=session_key,
-                env_overrides=env_overrides,
+        try:
+            session_id = str(
+                spawn(
+                    argv,
+                    cwd=target,
+                    session_key=session_key,
+                    env_overrides=env_overrides,
+                )
             )
-        )
+        except AutoLoadoutDispatchError:
+            raise
+        except Exception as exc:
+            raise AutoLoadoutDispatchError(
+                f"could not start automatic hermes-loadout {action}"
+            ) from exc
         return AutoLoadoutDispatchResult(
             True,
             action,
@@ -317,7 +384,14 @@ def dispatch_automatic_loadout_request(
         )
 
     control = run_control or _default_run_control
-    completed = control(argv, cwd=target, env_overrides=env_overrides)
+    try:
+        completed = control(argv, cwd=target, env_overrides=env_overrides)
+    except AutoLoadoutDispatchError:
+        raise
+    except Exception as exc:
+        raise AutoLoadoutDispatchError(
+            f"could not run automatic hermes-loadout {action}"
+        ) from exc
     output = str(completed.stdout or "").strip()
     error = str(completed.stderr or "").strip()
     if int(completed.returncode) != 0:

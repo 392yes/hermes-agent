@@ -10,7 +10,9 @@ import pytest
 
 from cli import HermesCLI
 from hermes_cli.loadout_auto_route import (
+    APPROVAL_TARGET_ENV,
     AUTO_LOADOUT_ENV,
+    AutoLoadoutDispatchError,
     apply_automatic_loadout_contract,
     dispatch_automatic_loadout_request,
 )
@@ -65,7 +67,10 @@ def test_plain_task_dispatches_canonical_start_without_foreground_chat(tmp_path:
         loaded_skills=["hermes-loadout", "hugo-crew-orchestration"],
         session_key="session-1",
         cwd=target,
-        environ={AUTO_LOADOUT_ENV: "1"},
+        environ={
+            AUTO_LOADOUT_ENV: "1",
+            APPROVAL_TARGET_ENV: "slack:C0B49801526",
+        },
         orchestrator_path=script,
         runtime_dir=tmp_path / "runtime",
         spawn_background=fake_spawn,
@@ -87,6 +92,43 @@ def test_plain_task_dispatches_canonical_start_without_foreground_chat(tmp_path:
     assert env_overrides[AUTO_LOADOUT_ENV] == "0"
 
 
+def test_start_omits_approval_target_when_launcher_does_not_configure_one(
+    tmp_path: Path,
+) -> None:
+    calls = []
+    dispatch_automatic_loadout_request(
+        "Implement the requested feature.",
+        loaded_skills=["hermes-loadout"],
+        session_key="session-1",
+        cwd=tmp_path,
+        environ={AUTO_LOADOUT_ENV: "1"},
+        orchestrator_path=_skill_script(tmp_path),
+        runtime_dir=tmp_path / "runtime",
+        spawn_background=lambda argv, **kwargs: calls.append(argv) or "proc_1",
+    )
+
+    assert "--approval-target" not in calls[0]
+
+
+def test_spawn_failures_are_wrapped_as_dispatch_errors(tmp_path: Path) -> None:
+    with pytest.raises(
+        AutoLoadoutDispatchError,
+        match="could not start automatic hermes-loadout start",
+    ):
+        dispatch_automatic_loadout_request(
+            "Implement the requested feature.",
+            loaded_skills=["hermes-loadout"],
+            session_key="session-1",
+            cwd=tmp_path,
+            environ={AUTO_LOADOUT_ENV: "1"},
+            orchestrator_path=_skill_script(tmp_path),
+            runtime_dir=tmp_path / "runtime",
+            spawn_background=lambda *args, **kwargs: (_ for _ in ()).throw(
+                OSError("spawn failed")
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("text", "expected_action"),
     [
@@ -94,9 +136,14 @@ def test_plain_task_dispatches_canonical_start_without_foreground_chat(tmp_path:
         ("진행 상황 알려줘", "status"),
         ("현재 작업 상태 보여줘", "status"),
         ("어디까지 진행됐어?", "status"),
+        ("What is the status?", "status"),
+        ("show status", "status"),
         ("계속", "resume"),
+        ("continue please", "resume"),
         ("승인 LAP-001 선택 RETRY", "approve"),
+        ("approve LAP-001 option RETRY", "approve"),
         ("거절 LAP-001", "reject"),
+        ("reject LAP-001", "reject"),
     ],
 )
 def test_control_inputs_never_start_a_competing_run(
@@ -136,6 +183,29 @@ def test_control_inputs_never_start_a_competing_run(
     assert len(all_argv) == 1
     assert all_argv[0][2] == expected_action
     assert "start" not in all_argv[0][1:]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["go ahead", "yes", "cancel", "stop", "ok"],
+)
+def test_ambiguous_control_replies_bypass_new_task_dispatch(
+    tmp_path: Path,
+    text: str,
+) -> None:
+    result = dispatch_automatic_loadout_request(
+        text,
+        loaded_skills=["hermes-loadout"],
+        session_key="session-1",
+        cwd=tmp_path,
+        environ={AUTO_LOADOUT_ENV: "1"},
+        orchestrator_path=_skill_script(tmp_path),
+        runtime_dir=tmp_path / "runtime",
+        spawn_background=lambda *args, **kwargs: pytest.fail("must not spawn"),
+    )
+
+    assert result.handled is False
+    assert result.action == "passthrough"
 
 
 @pytest.mark.parametrize(
@@ -207,6 +277,30 @@ def test_active_run_blocks_every_competing_writer(tmp_path: Path, text: str) -> 
 
     assert result.handled is True
     assert result.action == "active"
+
+
+def test_target_lock_blocks_writer_from_a_fresh_tui_session(tmp_path: Path) -> None:
+    target = tmp_path / "project"
+    target.mkdir()
+    lock_path = target / "prep" / "agent-loop" / ".orchestrator.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text("{}", encoding="utf-8")
+
+    result = dispatch_automatic_loadout_request(
+        "Implement another task.",
+        loaded_skills=["hermes-loadout"],
+        session_key="fresh-session",
+        cwd=target,
+        environ={AUTO_LOADOUT_ENV: "1"},
+        active_run=False,
+        orchestrator_path=_skill_script(tmp_path),
+        runtime_dir=tmp_path / "runtime",
+        spawn_background=lambda *args, **kwargs: pytest.fail("must not spawn"),
+    )
+
+    assert result.handled is True
+    assert result.action == "active"
+    assert "this target" in result.message
 
 
 def test_default_dispatch_starts_tracked_process_with_auto_marker_disabled(
