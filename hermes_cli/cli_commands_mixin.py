@@ -1149,6 +1149,63 @@ class CLICommandsMixin:
         print("  다음 턴부터 이 pane에서 새 모델로 응답합니다. (대화 맥락 자동 인계)")
         print(f"  override file: {clara_model_override_path()}")
 
+    def _handle_claude_account_command(self, cmd: str):
+        """Switch Claude Code credentials for only this running CLI process."""
+        from hermes_cli.claude_account import (
+            ClaudeAccountSelectionError,
+            apply_claude_account,
+            current_claude_account,
+            list_claude_accounts,
+        )
+
+        parts = cmd.split(maxsplit=1)
+        selector = parts[1].strip() if len(parts) > 1 else ""
+
+        if not selector or selector.casefold() == "status":
+            current = current_claude_account()
+            if current is None:
+                print("(._.) 현재 CLAUDE_CONFIG_DIR가 등록된 계정과 일치하지 않습니다.")
+            else:
+                print(
+                    f"  Current Claude account: {current.email or '(email unknown)'} "
+                    f"[{current.profile}]"
+                )
+            available = ", ".join(
+                f"{account.profile}={account.email or '(email unknown)'}"
+                for account in list_claude_accounts()
+            )
+            print(f"  Available: {available}")
+            print("  Usage: /claude-account <profile|email|email-local-part>")
+            print("  Scope: current CLI pane only")
+            return
+
+        try:
+            selected = apply_claude_account(selector)
+        except ClaudeAccountSelectionError as exc:
+            print(f"(._.) {exc}")
+            print("  Usage: /claude-account <profile|email|email-local-part>")
+            return
+
+        # A resident Claude child inherits credentials only when it starts.
+        # This pool is process-local, so clearing it cannot affect another pane.
+        resident_reset = True
+        try:
+            from gateway.claude_resident import get_pool
+
+            get_pool().shutdown_all()
+        except Exception:
+            resident_reset = False
+
+        print(
+            f"(^_^)b Claude account: {selected.email or '(email unknown)'} "
+            f"[{selected.profile}]"
+        )
+        if resident_reset:
+            print("  다음 Clara 턴부터 적용됩니다. 기존 Hermes 대화는 유지됩니다.")
+        else:
+            print("  Resident reset failed; restart this pane once before the next Clara turn.")
+        print("  Scope: current CLI pane only")
+
     def _handle_cron_command(self, cmd: str):
         """Handle the /cron command to manage scheduled tasks."""
         from cli import get_job

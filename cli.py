@@ -8293,6 +8293,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_model_switch(cmd_original)
         elif canonical == "model-swap":
             self._handle_model_swap_command(cmd_original)
+        elif canonical == "claude-account":
+            self._handle_claude_account_command(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
         elif canonical == "gquota":
