@@ -134,7 +134,7 @@ def _approve_review(orchestrator: ClaraCliveOrchestrator, job: dict) -> dict:
     _complete_task(
         orchestrator.board,
         job["review_task_id"],
-        profile="coda",
+        profile="vera",
         summary="PASS: scope, tests, and regression review complete",
         metadata={
             "review": {
@@ -232,7 +232,7 @@ def test_job_operations_reject_a_mismatched_persisted_board(
     assert ownership_count > 0
 
 
-def test_completed_implementation_is_scoped_patched_and_handed_to_coda(
+def test_completed_implementation_is_scoped_patched_and_handed_to_vera(
     orchestrator: ClaraCliveOrchestrator,
     clean_repo: Path,
 ) -> None:
@@ -249,7 +249,7 @@ def test_completed_implementation_is_scoped_patched_and_handed_to_coda(
     with kb.connect(board=orchestrator.board) as conn:
         review = kb.get_task(conn, reviewing["review_task_id"])
         assert review is not None
-        assert review.assignee == "coda"
+        assert review.assignee == "vera"
         assert review.workspace_path == reviewing["worktree"]
         assert review.status == "ready"
         assert reviewing["implementation_task_id"] in kb.parent_ids(
@@ -288,7 +288,7 @@ def test_known_untracked_worker_runtime_artifacts_are_removed_before_scope_gate(
     assert not pycache.exists()
 
 
-def test_concurrent_ticks_create_exactly_one_coda_review_card(
+def test_concurrent_ticks_create_exactly_one_vera_review_card(
     orchestrator: ClaraCliveOrchestrator,
     clean_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -320,7 +320,7 @@ def test_concurrent_ticks_create_exactly_one_coda_review_card(
     with kb.connect(board=orchestrator.board) as conn:
         review_tasks = [
             task
-            for task in kb.list_tasks(conn, assignee="coda")
+            for task in kb.list_tasks(conn, assignee="vera")
             if job["job_id"] in task.title
         ]
     assert len(review_tasks) == 1
@@ -364,7 +364,7 @@ def test_cancel_during_capture_cannot_resurrect_job_or_leave_active_review(
     with kb.connect(board=orchestrator.board) as conn:
         active_reviews = [
             task
-            for task in kb.list_tasks(conn, assignee="coda")
+            for task in kb.list_tasks(conn, assignee="vera")
             if job["job_id"] in task.title and task.status not in {"blocked", "archived"}
         ]
     assert active_reviews == []
@@ -519,7 +519,7 @@ def test_changed_symlink_is_rejected_before_patch_capture(
     assert "SYMLINK" in failed["error"]
 
 
-def test_coda_approval_allows_patch_apply_while_preserving_clara_parallel_work(
+def test_vera_approval_allows_patch_apply_while_preserving_clara_parallel_work(
     orchestrator: ClaraCliveOrchestrator,
     clean_repo: Path,
 ) -> None:
@@ -717,7 +717,7 @@ def test_apply_refuses_main_changes_outside_declared_clara_lane(
     assert (clean_repo / "impl.py").read_text(encoding="utf-8") == "VALUE = 1\n"
 
 
-def test_review_mutation_is_rejected_even_when_coda_reports_approve(
+def test_review_mutation_is_rejected_even_when_vera_reports_approve(
     orchestrator: ClaraCliveOrchestrator,
     clean_repo: Path,
 ) -> None:
@@ -786,7 +786,7 @@ def test_review_approval_requires_success_for_every_exact_declared_test(
     _complete_task(
         orchestrator.board,
         reviewing["review_task_id"],
-        profile="coda",
+        profile="vera",
         summary="PASS: review without declared test evidence",
         metadata={
             "review": {
@@ -813,7 +813,7 @@ def test_review_completion_without_explicit_approve_fails_closed(
     _complete_task(
         orchestrator.board,
         reviewing["review_task_id"],
-        profile="coda",
+        profile="vera",
         summary="Review completed with concerns",
         metadata={"review": {"verdict": "reject", "findings": ["bug"]}},
     )
@@ -833,7 +833,7 @@ def test_review_approve_without_patch_and_base_attestation_fails_closed(
     _complete_task(
         orchestrator.board,
         reviewing["review_task_id"],
-        profile="coda",
+        profile="vera",
         summary="PASS: but missing artifact attestation",
         metadata={
             "review": {
@@ -849,7 +849,7 @@ def test_review_approve_without_patch_and_base_attestation_fails_closed(
     assert "REVIEW_ATTESTATION_INVALID" in failed["error"]
 
 
-def test_forged_review_from_non_coda_run_is_rejected(
+def test_forged_review_from_non_vera_run_is_rejected(
     orchestrator: ClaraCliveOrchestrator,
     clean_repo: Path,
 ) -> None:
@@ -1253,7 +1253,7 @@ def test_blocked_worker_must_exit_before_job_failure_releases_ownership(
     assert "IMPLEMENTATION_BLOCKED" in failed["error"]
 
 
-def test_manual_claimer_cannot_forge_dispatched_coda_attestation(
+def test_manual_claimer_cannot_forge_dispatched_vera_attestation(
     orchestrator: ClaraCliveOrchestrator,
     clean_repo: Path,
 ) -> None:
@@ -1360,7 +1360,7 @@ def test_review_state_failure_compensates_unpublished_review_card(
     with kb.connect(board=orchestrator.board) as conn:
         reviews = [
             task
-            for task in kb.list_tasks(conn, assignee="coda")
+            for task in kb.list_tasks(conn, assignee="vera")
             if job["job_id"] in task.title
         ]
     assert reviews

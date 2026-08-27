@@ -2,7 +2,7 @@
 
 Thin coordinator that lets Clara split substantial coding work, run the
 separate ``clive`` Hermes profile asynchronously in a detached git worktree,
-gate the result through a ``coda`` review card, and integrate only a
+gate the result through a ``vera`` review card, and integrate only a
 conflict-free reviewed binary patch back into the main checkout.
 
 Durable queueing, worker launch, task/run logging, retry, and timeout
@@ -12,7 +12,7 @@ enforcement are deliberately delegated to the existing Hermes Kanban
 * exact file ownership (dedicated SQLite registry, transactional)
 * clean detached worktree lifecycle
 * scope validation and staged binary patch capture inside the worktree
-* the Coda review gate (verdict + patch immutability proof)
+* the Vera review gate (verdict + patch immutability proof)
 * fingerprint/apply-check guarded integration into the main checkout
 * a JSON CLI contract: dispatch / status / wait / cancel / cleanup / supervise
 
@@ -506,7 +506,7 @@ class ClaraClseOrchestrator:
         board: str = DEFAULT_BOARD,
         spawn_workers: bool = True,
         implementation_profile: str = "clive",
-        review_profile: str = "coda",
+        review_profile: str = "vera",
     ) -> None:
         if runtime_root is None:
             runtime_root = kb.kanban_home() / "runtime" / RUNTIME_DIRNAME
@@ -1232,7 +1232,7 @@ class ClaraClseOrchestrator:
         job_id = row["job_id"]
         body = "\n".join(
             [
-                f"Independent Coda review gate for Clara→Clive job `{job_id}`.",
+                f"Independent Vera review gate for Clara→Clive job `{job_id}`.",
                 "",
                 "## What to review",
                 f"- Worktree (read-only): {row['worktree']}",
@@ -1272,7 +1272,7 @@ class ClaraClseOrchestrator:
         with contextlib.closing(kb.connect(board=self.board)) as conn:
             return kb.create_task(
                 conn,
-                title=f"[clara-clive {job_id}] Coda review: {spec['title']}",
+                title=f"[clara-clive {job_id}] Vera review: {spec['title']}",
                 body=body,
                 assignee=self.review_profile,
                 created_by="clara",
@@ -1369,7 +1369,7 @@ class ClaraClseOrchestrator:
         if verdict != "approve":
             self._fail(
                 job_id,
-                f"REVIEW_REJECTED: coda verdict={verdict!r} "
+                f"REVIEW_REJECTED: vera verdict={verdict!r} "
                 f"(summary: {(run.summary or '').strip()[:200] if run else ''})",
                 expected=("reviewing",),
             )
@@ -1411,7 +1411,7 @@ class ClaraClseOrchestrator:
         if not attested:
             self._fail(
                 job_id,
-                "REVIEW_ATTESTATION_INVALID: approval must come from the coda "
+                "REVIEW_ATTESTATION_INVALID: approval must come from the vera "
                 "dispatcher worker run with verified capability, PASS summary, "
                 "empty findings, exact per-command exit_code=0 test evidence, "
                 "and exact patch_sha256/base_commit",
